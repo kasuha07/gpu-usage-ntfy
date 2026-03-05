@@ -1,6 +1,33 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nvml_wrapper::Nvml;
+use std::ffi::OsStr;
+use std::path::Path;
 use tracing::warn;
+
+const NVML_TRUSTED_LIB_PATHS: &[&str] = &[
+    "/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+    "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+    "/lib/x86_64-linux-gnu/libnvidia-ml.so",
+    "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so",
+    "/usr/lib/libnvidia-ml.so.1",
+    "/usr/lib/libnvidia-ml.so",
+    "/usr/local/lib/libnvidia-ml.so.1",
+    "/usr/local/lib/libnvidia-ml.so",
+    "/usr/lib/x86_64-linux-gnu/nvidia/current/libnvidia-ml.so.1",
+    "/usr/lib/x86_64-linux-gnu/nvidia/current/libnvidia-ml.so",
+    "/lib64/libnvidia-ml.so.1",
+    "/usr/lib64/libnvidia-ml.so.1",
+    "/lib64/libnvidia-ml.so",
+    "/usr/lib64/libnvidia-ml.so",
+    "/lib/aarch64-linux-gnu/libnvidia-ml.so.1",
+    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1",
+    "/lib/aarch64-linux-gnu/libnvidia-ml.so",
+    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so",
+    "/usr/lib/nvidia/current/libnvidia-ml.so.1",
+    "/usr/lib/nvidia/current/libnvidia-ml.so",
+    "/usr/lib/wsl/lib/libnvidia-ml.so.1",
+    "/usr/lib/wsl/lib/libnvidia-ml.so",
+];
 
 #[derive(Debug, Clone)]
 pub struct GpuSample {
@@ -32,9 +59,33 @@ pub struct NvmlSampler {
 
 impl NvmlSampler {
     pub fn new() -> Result<Self> {
-        let nvml = Nvml::init().context("failed to initialize NVML")?;
+        let nvml = init_nvml().context("failed to initialize NVML")?;
         Ok(Self { nvml })
     }
+}
+
+fn init_nvml() -> Result<Nvml> {
+    let mut attempts = Vec::new();
+
+    for &lib_path in NVML_TRUSTED_LIB_PATHS {
+        if !Path::new(lib_path).exists() {
+            attempts.push(format!("{lib_path} (not found)"));
+            continue;
+        }
+
+        let mut builder = Nvml::builder();
+        builder.lib_path(OsStr::new(lib_path));
+
+        match builder.init() {
+            Ok(nvml) => return Ok(nvml),
+            Err(error) => attempts.push(format!("{lib_path} ({error})")),
+        }
+    }
+
+    Err(anyhow!(
+        "failed to initialize NVML from trusted absolute paths: {}",
+        attempts.join(", ")
+    ))
 }
 
 impl GpuSampler for NvmlSampler {
