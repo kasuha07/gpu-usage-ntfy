@@ -91,8 +91,8 @@ impl Notifier for NtfyNotifier {
     async fn send_event(&self, event: &PolicyEvent) -> Result<()> {
         let mut tags = self.config.tags.clone();
         let (status_text, extra_tag) = match event.kind {
-            PolicyEventKind::Alert => ("ALERT", "alert"),
-            PolicyEventKind::Recovery => ("RECOVERY", "recovery"),
+            PolicyEventKind::Alert => ("IDLE", "idle"),
+            PolicyEventKind::Recovery => ("BUSY", "busy"),
         };
 
         tags.push(extra_tag.to_string());

@@ -184,9 +184,9 @@ pub struct NotificationPolicyConfig {
 impl Default for NotificationPolicyConfig {
     fn default() -> Self {
         Self {
-            gpu_util_percent: 90.0,
-            memory_util_percent: 90.0,
-            trigger_mode: TriggerMode::Any,
+            gpu_util_percent: 20.0,
+            memory_util_percent: 20.0,
+            trigger_mode: TriggerMode::Both,
             trigger_after_consecutive_samples: 3,
             recovery_after_consecutive_samples: 2,
             resend_cooldown_seconds: 1800,
@@ -345,6 +345,8 @@ topic = "my-topic"
 
         assert_eq!(cfg.monitor.interval_seconds, 10);
         assert_eq!(cfg.ntfy.server, "https://ntfy.sh");
-        assert_eq!(cfg.policy.trigger_mode, TriggerMode::Any);
+        assert_eq!(cfg.policy.trigger_mode, TriggerMode::Both);
+        assert_eq!(cfg.policy.gpu_util_percent, 20.0);
+        assert_eq!(cfg.policy.memory_util_percent, 20.0);
     }
 }

@@ -126,7 +126,7 @@ where
     async fn send_startup_notification(&self) {
         let title = format!("{} [SYSTEM] STARTED", self.config.ntfy.title_prefix);
         let body = format!(
-            "gpu monitor started. interval={}s trigger_mode={} gpu_threshold={:.2}% mem_threshold={:.2}%",
+            "gpu idle monitor started. interval={}s trigger_mode={} idle_gpu_max={:.2}% idle_mem_max={:.2}%",
             self.config.monitor.interval_seconds,
             self.config.policy.trigger_mode,
             self.config.policy.gpu_util_percent,
@@ -183,8 +183,8 @@ fn bytes_to_mib(bytes: u64) -> f64 {
 #[allow(dead_code)]
 fn _event_kind_to_string(kind: &PolicyEventKind) -> &'static str {
     match kind {
-        PolicyEventKind::Alert => "alert",
-        PolicyEventKind::Recovery => "recovery",
+        PolicyEventKind::Alert => "idle",
+        PolicyEventKind::Recovery => "busy",
     }
 }
 
@@ -281,13 +281,13 @@ mod tests {
         }
     }
 
-    fn sample_high() -> GpuSample {
+    fn sample_idle() -> GpuSample {
         GpuSample {
             index: 0,
             uuid: "GPU-TEST".to_string(),
             name: "Test GPU".to_string(),
-            gpu_util_percent: 95.0,
-            memory_used_bytes: 900,
+            gpu_util_percent: 5.0,
+            memory_used_bytes: 50,
             memory_total_bytes: 1000,
         }
     }
@@ -302,9 +302,9 @@ mod tests {
             ntfy: NtfyConfig::default(),
             quiet_hours: Vec::new(),
             policy: NotificationPolicyConfig {
-                gpu_util_percent: 80.0,
-                memory_util_percent: 80.0,
-                trigger_mode: TriggerMode::Any,
+                gpu_util_percent: 20.0,
+                memory_util_percent: 20.0,
+                trigger_mode: TriggerMode::Both,
                 trigger_after_consecutive_samples: 1,
                 recovery_after_consecutive_samples: 1,
                 resend_cooldown_seconds: 600,
@@ -317,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn notification_failure_rolls_back_alert_state() {
         let config = base_config();
-        let sampler = SequenceSampler::new(vec![vec![sample_high()], vec![sample_high()]]);
+        let sampler = SequenceSampler::new(vec![vec![sample_idle()], vec![sample_idle()]]);
         let notifier = MockNotifier::new(true);
 
         let mut app = MonitorApp::new(config, sampler, notifier.clone());
@@ -339,7 +339,7 @@ mod tests {
             end: crate::config::ClockTime::from_hhmm_for_test(0, 0),
         }];
 
-        let sampler = SequenceSampler::new(vec![vec![sample_high()]]);
+        let sampler = SequenceSampler::new(vec![vec![sample_idle()]]);
         let notifier = MockNotifier::new(false);
         let mut app = MonitorApp::new(config, sampler, notifier.clone());
 

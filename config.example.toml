@@ -29,17 +29,17 @@ start = "22:00"
 end = "08:00"
 
 [policy]
-# GPU 核心利用率阈值（%）
-gpu_util_percent = 90.0
-# 显存利用率阈值（%）
-memory_util_percent = 90.0
-# any: 任一指标超阈值触发；both: 两者都超阈值才触发
-trigger_mode = "any"
-# 连续超阈值样本数达到后触发告警
+# GPU 空闲判定上限（%）：当前利用率 <= 此值视为“空闲”
+gpu_util_percent = 20.0
+# 显存空闲判定上限（%）：当前显存占用 <= 此值视为“空闲”
+memory_util_percent = 20.0
+# any: 任一指标满足空闲判定即触发；both: 两者都满足空闲判定才触发
+trigger_mode = "both"
+# 连续满足空闲判定样本数达到后触发通知
 trigger_after_consecutive_samples = 3
-# 连续恢复样本数达到后触发恢复通知
+# 连续不满足空闲判定样本数达到后触发恢复通知（表示 GPU 再次变忙）
 recovery_after_consecutive_samples = 2
-# 告警重复发送冷却时间（秒）
+# 空闲通知重复发送冷却时间（秒）
 resend_cooldown_seconds = 1800
 # 是否发送恢复通知
 send_recovery = true

@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "gpu-usage-ntfy",
     version,
-    about = "持续监控 GPU 使用率/显存占用并通过 ntfy 发送通知"
+    about = "持续监控 GPU 空闲状态（基于利用率/显存阈值）并通过 ntfy 发送通知"
 )]
 struct Args {
     /// 配置文件路径（TOML）
