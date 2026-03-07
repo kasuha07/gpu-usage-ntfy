@@ -1,12 +1,13 @@
+use crate::timeutil;
 use anyhow::{Context, Result, bail};
-use chrono::{Local, Timelike};
+use chrono::Timelike;
 use serde::Deserialize;
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub monitor: MonitorConfig,
@@ -105,7 +106,9 @@ impl AppConfig {
             return false;
         }
 
-        let now = Local::now().time();
+        let now = chrono::Utc::now()
+            .with_timezone(&timeutil::utc8_offset())
+            .time();
         self.quiet_hours.iter().any(|q| q.contains_time(now))
     }
 }
@@ -118,7 +121,7 @@ fn parse_env_ref(input: &str) -> Option<&str> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MonitorConfig {
     pub interval_seconds: u64,
@@ -136,7 +139,7 @@ impl Default for MonitorConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NtfyConfig {
     pub server: String,
@@ -168,7 +171,7 @@ impl Default for NtfyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NotificationPolicyConfig {
     pub gpu_util_percent: f64,
@@ -212,7 +215,7 @@ impl Display for TriggerMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 pub struct QuietWindow {
     pub start: ClockTime,
     pub end: ClockTime,

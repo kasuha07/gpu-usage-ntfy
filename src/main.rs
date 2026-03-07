@@ -3,15 +3,19 @@ mod config;
 mod gpu;
 mod notify;
 mod policy;
+mod timeutil;
 
-use crate::app::MonitorApp;
+use crate::app::{MonitorApp, NtfyNotifierFactory};
 use crate::config::AppConfig;
 use crate::gpu::NvmlSampler;
-use crate::notify::NtfyNotifier;
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,8 +42,8 @@ async fn main() -> Result<()> {
     })?;
 
     let sampler = NvmlSampler::new()?;
-    let notifier = NtfyNotifier::new(config.ntfy.clone())?;
-    let mut app = MonitorApp::new(config, sampler, notifier);
+    let notifier_factory = Arc::new(NtfyNotifierFactory);
+    let mut app = MonitorApp::new(&args.config, config, sampler, notifier_factory)?;
 
     app.run().await
 }
@@ -49,10 +53,20 @@ fn init_tracing() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_timer(Utc8Timer)
         .with_target(false)
         .compact()
         .try_init()
         .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
 
     Ok(())
+}
+
+struct Utc8Timer;
+
+impl FormatTime for Utc8Timer {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        let now = crate::timeutil::now_utc8_rfc3339_micros();
+        write!(w, "{now}")
+    }
 }

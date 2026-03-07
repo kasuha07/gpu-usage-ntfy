@@ -1,39 +1,69 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, NtfyConfig};
 use crate::gpu::GpuSampler;
-use crate::notify::Notifier;
+use crate::notify::{Notifier, NtfyNotifier};
 use crate::policy::{PolicyEngine, PolicyEvent, PolicyEventKind};
 use anyhow::Result;
 use chrono::Utc;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
-pub struct MonitorApp<S, N>
+pub trait NotifierFactory: Send + Sync {
+    fn build(&self, config: NtfyConfig) -> Result<Arc<dyn Notifier>>;
+}
+
+#[derive(Default)]
+pub struct NtfyNotifierFactory;
+
+impl NotifierFactory for NtfyNotifierFactory {
+    fn build(&self, config: NtfyConfig) -> Result<Arc<dyn Notifier>> {
+        Ok(Arc::new(NtfyNotifier::new(config)?))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReloadOutcome {
+    Unchanged,
+    Reloaded { interval_changed: bool },
+    Failed,
+}
+
+pub struct MonitorApp<S>
 where
     S: GpuSampler,
-    N: Notifier,
 {
+    config_path: PathBuf,
     config: AppConfig,
     sampler: S,
-    notifier: N,
+    notifier: Arc<dyn Notifier>,
+    notifier_factory: Arc<dyn NotifierFactory>,
     policy_engine: PolicyEngine,
 }
 
-impl<S, N> MonitorApp<S, N>
+impl<S> MonitorApp<S>
 where
     S: GpuSampler,
-    N: Notifier,
 {
-    pub fn new(config: AppConfig, sampler: S, notifier: N) -> Self {
+    pub fn new(
+        config_path: impl AsRef<Path>,
+        config: AppConfig,
+        sampler: S,
+        notifier_factory: Arc<dyn NotifierFactory>,
+    ) -> Result<Self> {
+        let notifier = notifier_factory.build(config.ntfy.clone())?;
         let policy_engine = PolicyEngine::new(config.policy.clone());
 
-        Self {
+        Ok(Self {
+            config_path: config_path.as_ref().to_path_buf(),
             config,
             sampler,
             notifier,
+            notifier_factory,
             policy_engine,
-        }
+        })
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -41,11 +71,13 @@ where
             self.send_startup_notification().await;
         }
 
-        let mut ticker = interval(Duration::from_secs(self.config.monitor.interval_seconds));
+        let mut current_interval = self.config.monitor.interval_seconds;
+        let mut ticker = interval(Duration::from_secs(current_interval));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         info!(
             interval_seconds = self.config.monitor.interval_seconds,
+            config_path = %self.config_path.display(),
             "GPU monitor started"
         );
 
@@ -57,6 +89,19 @@ where
                     break;
                 }
                 _ = ticker.tick() => {
+                    match self.try_reload_config() {
+                        ReloadOutcome::Reloaded { interval_changed } if interval_changed => {
+                            current_interval = self.config.monitor.interval_seconds;
+                            ticker = interval(Duration::from_secs(current_interval));
+                            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            info!(
+                                interval_seconds = current_interval,
+                                "monitor interval updated from reloaded config"
+                            );
+                        }
+                        ReloadOutcome::Failed | ReloadOutcome::Unchanged | ReloadOutcome::Reloaded { .. } => {}
+                    }
+
                     if let Err(err) = self.poll_once().await {
                         error!(error = ?err, "poll cycle failed");
                     }
@@ -123,10 +168,62 @@ where
         Ok(())
     }
 
+    fn try_reload_config(&mut self) -> ReloadOutcome {
+        let new_config = match AppConfig::load(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warn!(
+                    config_path = %self.config_path.display(),
+                    error = ?err,
+                    "failed to reload config, keeping previous in-memory config"
+                );
+                return ReloadOutcome::Failed;
+            }
+        };
+
+        if new_config == self.config {
+            return ReloadOutcome::Unchanged;
+        }
+
+        let interval_changed =
+            new_config.monitor.interval_seconds != self.config.monitor.interval_seconds;
+        let ntfy_changed = new_config.ntfy != self.config.ntfy;
+
+        let mut new_notifier = None;
+        if ntfy_changed {
+            match self.notifier_factory.build(new_config.ntfy.clone()) {
+                Ok(notifier) => new_notifier = Some(notifier),
+                Err(err) => {
+                    warn!(
+                        config_path = %self.config_path.display(),
+                        error = ?err,
+                        "failed to rebuild notifier from reloaded config, keeping previous config"
+                    );
+                    return ReloadOutcome::Failed;
+                }
+            }
+        }
+
+        self.config = new_config;
+        if let Some(notifier) = new_notifier {
+            self.notifier = notifier;
+        }
+        self.policy_engine = PolicyEngine::new(self.config.policy.clone());
+
+        info!(
+            config_path = %self.config_path.display(),
+            interval_seconds = self.config.monitor.interval_seconds,
+            ntfy_changed,
+            "config reloaded"
+        );
+
+        ReloadOutcome::Reloaded { interval_changed }
+    }
+
     async fn send_startup_notification(&self) {
-        let title = format!("{} [SYSTEM] STARTED", self.config.ntfy.title_prefix);
+        let title = format!("{} [系统] 已启动", self.config.ntfy.title_prefix);
         let body = format!(
-            "gpu idle monitor started. interval={}s trigger_mode={} idle_gpu_max={:.2}% idle_mem_max={:.2}%",
+            "GPU 空闲监控已启动。采样间隔={}秒，触发模式={}，空闲阈值：核心利用率≤{:.2}%，显存占用率≤{:.2}%。",
             self.config.monitor.interval_seconds,
             self.config.policy.trigger_mode,
             self.config.policy.gpu_util_percent,
@@ -151,8 +248,8 @@ where
     }
 
     async fn send_shutdown_notification(&self) {
-        let title = format!("{} [SYSTEM] STOPPED", self.config.ntfy.title_prefix);
-        let body = "gpu monitor stopped gracefully".to_string();
+        let title = format!("{} [系统] 已停止", self.config.ntfy.title_prefix);
+        let body = "GPU 监控程序已正常停止。".to_string();
 
         let mut tags = self.config.ntfy.tags.clone();
         tags.push("shutdown".to_string());
@@ -183,8 +280,8 @@ fn bytes_to_mib(bytes: u64) -> f64 {
 #[allow(dead_code)]
 fn _event_kind_to_string(kind: &PolicyEventKind) -> &'static str {
     match kind {
-        PolicyEventKind::Alert => "idle",
-        PolicyEventKind::Recovery => "busy",
+        PolicyEventKind::Alert => "空闲",
+        PolicyEventKind::Recovery => "繁忙",
     }
 }
 
@@ -210,7 +307,9 @@ mod tests {
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Clone)]
     struct SequenceSampler {
@@ -236,6 +335,7 @@ mod tests {
     struct MockNotifier {
         fail_first_event: Arc<Mutex<bool>>,
         event_calls: Arc<Mutex<u32>>,
+        text_messages: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl MockNotifier {
@@ -243,11 +343,19 @@ mod tests {
             Self {
                 fail_first_event: Arc::new(Mutex::new(fail_first_event)),
                 event_calls: Arc::new(Mutex::new(0)),
+                text_messages: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn event_calls(&self) -> u32 {
             *self.event_calls.lock().expect("event_calls mutex poisoned")
+        }
+
+        fn text_messages(&self) -> Vec<(String, String)> {
+            self.text_messages
+                .lock()
+                .expect("text_messages mutex poisoned")
+                .clone()
         }
     }
 
@@ -272,12 +380,54 @@ mod tests {
 
         async fn send_text(
             &self,
-            _title: &str,
-            _body: &str,
+            title: &str,
+            body: &str,
             _tags: &[String],
             _priority: u8,
         ) -> Result<()> {
+            self.text_messages
+                .lock()
+                .expect("text_messages mutex poisoned")
+                .push((title.to_string(), body.to_string()));
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticNotifierFactory {
+        notifier: MockNotifier,
+        build_calls: Arc<Mutex<u32>>,
+        fail_build: Arc<Mutex<bool>>,
+    }
+
+    impl StaticNotifierFactory {
+        fn new(notifier: MockNotifier) -> Self {
+            Self {
+                notifier,
+                build_calls: Arc::new(Mutex::new(0)),
+                fail_build: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        fn build_calls(&self) -> u32 {
+            *self.build_calls.lock().expect("build_calls mutex poisoned")
+        }
+
+        fn set_fail_build(&self, fail: bool) {
+            *self.fail_build.lock().expect("fail_build mutex poisoned") = fail;
+        }
+    }
+
+    impl NotifierFactory for StaticNotifierFactory {
+        fn build(&self, _config: NtfyConfig) -> Result<Arc<dyn Notifier>> {
+            let mut calls = self.build_calls.lock().expect("build_calls mutex poisoned");
+            *calls += 1;
+
+            if *self.fail_build.lock().expect("fail_build mutex poisoned") {
+                return Err(anyhow!("injected factory failure"));
+            }
+
+            Ok(Arc::new(self.notifier.clone()))
         }
     }
 
@@ -314,13 +464,26 @@ mod tests {
         }
     }
 
+    fn write_temp_config(content: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("gpu-usage-ntfy-test-{nanos}.toml"));
+        fs::write(&path, content).expect("failed to write temp config");
+        path
+    }
+
     #[tokio::test]
     async fn notification_failure_rolls_back_alert_state() {
         let config = base_config();
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
         let sampler = SequenceSampler::new(vec![vec![sample_idle()], vec![sample_idle()]]);
         let notifier = MockNotifier::new(true);
+        let factory = StaticNotifierFactory::new(notifier.clone());
 
-        let mut app = MonitorApp::new(config, sampler, notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
 
         app.poll_once().await.expect("first poll should finish");
         assert_eq!(notifier.event_calls(), 1);
@@ -339,12 +502,222 @@ mod tests {
             end: crate::config::ClockTime::from_hhmm_for_test(0, 0),
         }];
 
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
         let sampler = SequenceSampler::new(vec![vec![sample_idle()]]);
         let notifier = MockNotifier::new(false);
-        let mut app = MonitorApp::new(config, sampler, notifier.clone());
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
 
         app.poll_once().await.expect("poll should finish");
         assert_eq!(notifier.event_calls(), 0);
         assert_eq!(app.policy_engine.active_alerts(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_notification_uses_chinese_content() {
+        let mut config = base_config();
+        config.monitor.send_startup_notification = true;
+        config.ntfy.title_prefix = "GPU 监控".to_string();
+
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.send_startup_notification().await;
+
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].0.contains("[系统] 已启动"));
+        assert!(messages[0].1.contains("GPU 空闲监控已启动"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_notification_uses_chinese_content() {
+        let mut config = base_config();
+        config.ntfy.title_prefix = "GPU 监控".to_string();
+
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.send_shutdown_notification().await;
+
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].0.contains("[系统] 已停止"));
+        assert!(messages[0].1.contains("GPU 监控程序已正常停止"));
+    }
+
+    #[test]
+    fn reload_applies_new_config_and_rebuilds_notifier() {
+        let initial_path = write_temp_config(
+            r#"
+[monitor]
+interval_seconds = 10
+send_startup_notification = false
+sample_log = false
+
+[ntfy]
+server = "https://ntfy.sh"
+topic = "topic-a"
+title_prefix = "GPU Monitor"
+priority = 4
+tags = ["gpu"]
+timeout_seconds = 10
+max_retries = 3
+retry_initial_backoff_millis = 500
+
+[policy]
+gpu_util_percent = 20.0
+memory_util_percent = 20.0
+trigger_mode = "both"
+trigger_after_consecutive_samples = 1
+recovery_after_consecutive_samples = 1
+resend_cooldown_seconds = 600
+send_recovery = true
+suppress_in_quiet_hours = true
+"#,
+        );
+
+        let config = AppConfig::load(&initial_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier);
+
+        let mut app = MonitorApp::new(&initial_path, config, sampler, Arc::new(factory.clone()))
+            .expect("app should construct");
+
+        assert_eq!(factory.build_calls(), 1);
+
+        fs::write(
+            &initial_path,
+            r#"
+[monitor]
+interval_seconds = 3
+send_startup_notification = false
+sample_log = true
+
+[ntfy]
+server = "https://ntfy.sh"
+topic = "topic-b"
+title_prefix = "GPU Reloaded"
+priority = 5
+tags = ["gpu", "reload"]
+timeout_seconds = 10
+max_retries = 3
+retry_initial_backoff_millis = 500
+
+[policy]
+gpu_util_percent = 30.0
+memory_util_percent = 25.0
+trigger_mode = "any"
+trigger_after_consecutive_samples = 2
+recovery_after_consecutive_samples = 2
+resend_cooldown_seconds = 60
+send_recovery = false
+suppress_in_quiet_hours = false
+"#,
+        )
+        .expect("should update config file");
+
+        let outcome = app.try_reload_config();
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                interval_changed: true
+            }
+        );
+        assert_eq!(factory.build_calls(), 2);
+        assert_eq!(app.config.monitor.interval_seconds, 3);
+        assert!(app.config.monitor.sample_log);
+        assert_eq!(app.config.ntfy.topic, "topic-b");
+        assert_eq!(app.config.policy.gpu_util_percent, 30.0);
+        assert_eq!(app.config.policy.trigger_mode, TriggerMode::Any);
+    }
+
+    #[test]
+    fn reload_invalid_config_keeps_previous_config() {
+        let config_path = write_temp_config(
+            r#"
+[ntfy]
+topic = "topic-a"
+"#,
+        );
+
+        let config = AppConfig::load(&config_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier);
+
+        let mut app = MonitorApp::new(
+            &config_path,
+            config.clone(),
+            sampler,
+            Arc::new(factory.clone()),
+        )
+        .expect("app should construct");
+
+        assert_eq!(factory.build_calls(), 1);
+
+        fs::write(
+            &config_path,
+            r#"
+[monitor]
+interval_seconds = 0
+
+[ntfy]
+topic = "topic-a"
+"#,
+        )
+        .expect("should write invalid config");
+
+        let outcome = app.try_reload_config();
+        assert_eq!(outcome, ReloadOutcome::Failed);
+        assert_eq!(factory.build_calls(), 1);
+        assert_eq!(app.config, config);
+    }
+
+    #[test]
+    fn reload_notifier_build_failure_keeps_previous_config() {
+        let config_path = write_temp_config(
+            r#"
+[ntfy]
+topic = "topic-a"
+"#,
+        );
+
+        let config = AppConfig::load(&config_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier);
+
+        let mut app = MonitorApp::new(
+            &config_path,
+            config.clone(),
+            sampler,
+            Arc::new(factory.clone()),
+        )
+        .expect("app should construct");
+
+        factory.set_fail_build(true);
+        fs::write(
+            &config_path,
+            r#"
+[ntfy]
+topic = "topic-b"
+"#,
+        )
+        .expect("should write updated config");
+
+        let outcome = app.try_reload_config();
+        assert_eq!(outcome, ReloadOutcome::Failed);
+        assert_eq!(app.config, config);
     }
 }

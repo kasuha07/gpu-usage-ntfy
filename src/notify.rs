@@ -1,9 +1,10 @@
 use crate::config::NtfyConfig;
 use crate::policy::{PolicyEvent, PolicyEventKind};
+use crate::timeutil;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use reqwest::{Client, Request};
+use reqwest::{Client, Request, StatusCode};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
@@ -59,11 +60,13 @@ impl NtfyNotifier {
                 Ok(response) => {
                     let status = response.status();
                     let message = response.text().await.unwrap_or_default();
-                    last_error = Some(anyhow!(
-                        "ntfy request failed with status {}: {}",
-                        status,
-                        message
-                    ));
+                    let error = build_http_error(status, &message, &self.config);
+
+                    if !is_retryable_status(status) {
+                        return Err(error);
+                    }
+
+                    last_error = Some(error);
                 }
                 Err(err) => {
                     last_error = Some(anyhow!("failed to send ntfy notification: {err}"));
@@ -90,10 +93,7 @@ impl NtfyNotifier {
 impl Notifier for NtfyNotifier {
     async fn send_event(&self, event: &PolicyEvent) -> Result<()> {
         let mut tags = self.config.tags.clone();
-        let (status_text, extra_tag) = match event.kind {
-            PolicyEventKind::Alert => ("IDLE", "idle"),
-            PolicyEventKind::Recovery => ("BUSY", "busy"),
-        };
+        let (status_text, extra_tag) = localized_status_and_tag(event.kind.clone());
 
         tags.push(extra_tag.to_string());
 
@@ -103,13 +103,12 @@ impl Notifier for NtfyNotifier {
         );
 
         let body = format!(
-            "gpu_index={} gpu_uuid={} gpu_util={:.2}% mem_util={:.2}% reason={} at={}",
+            "GPU序号={} 核心利用率={:.2}% 显存占用率={:.2}% 原因={} 时间={}",
             event.gpu_index,
-            event.gpu_uuid,
             event.gpu_util_percent,
             event.memory_util_percent,
-            event.reason,
-            event.at.to_rfc3339()
+            localize_reason(event.reason.as_str()),
+            timeutil::format_utc8(&event.at)
         );
 
         let priority = match event.kind {
@@ -181,6 +180,53 @@ pub(crate) fn build_publish_request(
         .context("failed to build ntfy request")?;
 
     Ok(request)
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+fn build_http_error(status: StatusCode, message: &str, config: &NtfyConfig) -> anyhow::Error {
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        let token_hint = if config
+            .token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            "当前已配置 token，请确认该 token 对此 topic 具备 publish 权限；如果是 ntfy.sh 公共 topic，可尝试移除 token。"
+        } else {
+            "当前未配置 token；如果 topic 受保护，请配置 token 或 token_env。"
+        };
+
+        return anyhow!(
+            "ntfy authentication failed with status {} (server={} topic={}): {}. {}",
+            status,
+            config.server,
+            config.topic,
+            message,
+            token_hint
+        );
+    }
+
+    anyhow!("ntfy request failed with status {}: {}", status, message)
+}
+
+fn localized_status_and_tag(kind: PolicyEventKind) -> (&'static str, &'static str) {
+    match kind {
+        PolicyEventKind::Alert => ("空闲", "idle"),
+        PolicyEventKind::Recovery => ("繁忙恢复", "busy"),
+    }
+}
+
+fn localize_reason(reason: &str) -> &str {
+    match reason {
+        "idle_detected" => "检测到 GPU 空闲",
+        "idle_still_detected" => "GPU 持续空闲",
+        "busy_detected" => "GPU 已恢复繁忙",
+        _ => reason,
+    }
 }
 
 #[cfg(test)]
@@ -261,5 +307,41 @@ mod tests {
     fn notifier_topic_url() {
         let notifier = NtfyNotifier::new(test_config()).unwrap();
         assert_eq!(notifier.topic_url(), "https://ntfy.example.com/gpu-topic");
+    }
+
+    #[test]
+    fn forbidden_is_not_retryable() {
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn too_many_requests_is_retryable() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn auth_error_contains_actionable_hint() {
+        let config = test_config();
+        let err = build_http_error(StatusCode::FORBIDDEN, "forbidden", &config).to_string();
+        assert!(err.contains("publish 权限"));
+        assert!(err.contains("server=https://ntfy.example.com"));
+        assert!(err.contains("topic=gpu-topic"));
+    }
+
+    #[test]
+    fn event_status_text_is_chinese() {
+        let (alert_status, _) = localized_status_and_tag(PolicyEventKind::Alert);
+        let (recovery_status, _) = localized_status_and_tag(PolicyEventKind::Recovery);
+        assert_eq!(alert_status, "空闲");
+        assert_eq!(recovery_status, "繁忙恢复");
+    }
+
+    #[test]
+    fn reason_text_is_localized_to_chinese() {
+        assert_eq!(localize_reason("idle_detected"), "检测到 GPU 空闲");
+        assert_eq!(localize_reason("idle_still_detected"), "GPU 持续空闲");
+        assert_eq!(localize_reason("busy_detected"), "GPU 已恢复繁忙");
     }
 }
