@@ -114,6 +114,7 @@ where
 
     pub(crate) async fn poll_once(&mut self) -> Result<()> {
         let samples = self.sampler.sample_all()?;
+        let mut events_to_send = Vec::new();
 
         if samples.is_empty() {
             warn!("no GPU devices found by NVML");
@@ -147,22 +148,25 @@ where
                     continue;
                 }
 
-                if let Err(err) = self.notifier.send_event(&event).await {
-                    error!(
-                        error = ?err,
-                        gpu_uuid = %event.gpu_uuid,
-                        event_kind = ?event.kind,
-                        "failed to send ntfy notification"
-                    );
-                    self.policy_engine.on_notification_not_sent(&event);
-                } else {
-                    info!(
-                        gpu_uuid = %event.gpu_uuid,
-                        event_kind = ?event.kind,
-                        "ntfy notification sent"
-                    );
-                }
+                events_to_send.push(event);
             }
+        }
+
+        if events_to_send.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(err) = self.notifier.send_events(&events_to_send).await {
+            error!(
+                error = ?err,
+                event_count = events_to_send.len(),
+                "failed to send ntfy notification"
+            );
+            for event in &events_to_send {
+                self.policy_engine.on_notification_not_sent(event);
+            }
+        } else {
+            info!(event_count = events_to_send.len(), "ntfy notification sent");
         }
 
         Ok(())
@@ -333,22 +337,31 @@ mod tests {
 
     #[derive(Clone)]
     struct MockNotifier {
-        fail_first_event: Arc<Mutex<bool>>,
-        event_calls: Arc<Mutex<u32>>,
+        fail_first_send: Arc<Mutex<bool>>,
+        send_calls: Arc<Mutex<u32>>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
         text_messages: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl MockNotifier {
-        fn new(fail_first_event: bool) -> Self {
+        fn new(fail_first_send: bool) -> Self {
             Self {
-                fail_first_event: Arc::new(Mutex::new(fail_first_event)),
-                event_calls: Arc::new(Mutex::new(0)),
+                fail_first_send: Arc::new(Mutex::new(fail_first_send)),
+                send_calls: Arc::new(Mutex::new(0)),
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
                 text_messages: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn event_calls(&self) -> u32 {
-            *self.event_calls.lock().expect("event_calls mutex poisoned")
+            *self.send_calls.lock().expect("send_calls mutex poisoned")
+        }
+
+        fn batch_sizes(&self) -> Vec<usize> {
+            self.batch_sizes
+                .lock()
+                .expect("batch_sizes mutex poisoned")
+                .clone()
         }
 
         fn text_messages(&self) -> Vec<(String, String)> {
@@ -361,14 +374,18 @@ mod tests {
 
     #[async_trait]
     impl Notifier for MockNotifier {
-        async fn send_event(&self, _event: &PolicyEvent) -> Result<()> {
-            let mut calls = self.event_calls.lock().expect("event_calls mutex poisoned");
+        async fn send_events(&self, events: &[PolicyEvent]) -> Result<()> {
+            let mut calls = self.send_calls.lock().expect("send_calls mutex poisoned");
             *calls += 1;
+            self.batch_sizes
+                .lock()
+                .expect("batch_sizes mutex poisoned")
+                .push(events.len());
 
             let mut fail_first = self
-                .fail_first_event
+                .fail_first_send
                 .lock()
-                .expect("fail_first_event mutex poisoned");
+                .expect("fail_first_send mutex poisoned");
 
             if *fail_first {
                 *fail_first = false;
@@ -442,6 +459,17 @@ mod tests {
         }
     }
 
+    fn sample_idle_with(index: u32, uuid: &str) -> GpuSample {
+        GpuSample {
+            index,
+            uuid: uuid.to_string(),
+            name: format!("Test GPU {index}"),
+            gpu_util_percent: 5.0,
+            memory_used_bytes: 50,
+            memory_total_bytes: 1000,
+        }
+    }
+
     fn base_config() -> AppConfig {
         AppConfig {
             monitor: MonitorConfig {
@@ -457,6 +485,7 @@ mod tests {
                 trigger_mode: TriggerMode::Both,
                 trigger_after_consecutive_samples: 1,
                 recovery_after_consecutive_samples: 1,
+                repeat_idle_notifications: false,
                 resend_cooldown_seconds: 600,
                 send_recovery: true,
                 suppress_in_quiet_hours: true,
@@ -512,6 +541,26 @@ mod tests {
         app.poll_once().await.expect("poll should finish");
         assert_eq!(notifier.event_calls(), 0);
         assert_eq!(app.policy_engine.active_alerts(), 0);
+    }
+
+    #[tokio::test]
+    async fn events_in_same_poll_are_sent_in_single_batch() {
+        let config = base_config();
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![vec![
+            sample_idle_with(5, "GPU-5"),
+            sample_idle_with(6, "GPU-6"),
+            sample_idle_with(7, "GPU-7"),
+        ]]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("poll should finish");
+
+        assert_eq!(notifier.event_calls(), 1);
+        assert_eq!(notifier.batch_sizes(), vec![3]);
     }
 
     #[tokio::test]

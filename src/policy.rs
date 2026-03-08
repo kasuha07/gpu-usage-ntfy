@@ -16,9 +16,9 @@ pub struct PolicyEvent {
     pub gpu_name: String,
     pub gpu_util_percent: f64,
     pub memory_util_percent: f64,
+    pub memory_used_bytes: u64,
     pub kind: PolicyEventKind,
     pub reason: String,
-    pub at: DateTime<Utc>,
     state_mutation: StateMutation,
 }
 
@@ -82,15 +82,19 @@ impl PolicyEngine {
                         gpu_name: sample.name.clone(),
                         gpu_util_percent: sample.gpu_util_percent,
                         memory_util_percent,
+                        memory_used_bytes: sample.memory_used_bytes,
                         kind: PolicyEventKind::Alert,
                         reason: "idle_detected".to_string(),
-                        at: now,
                         state_mutation: StateMutation::ActivateAlert {
                             previous_last_alert_sent_at,
                         },
                     });
                 }
 
+                return None;
+            }
+
+            if !self.config.repeat_idle_notifications {
                 return None;
             }
 
@@ -112,9 +116,9 @@ impl PolicyEngine {
                     gpu_name: sample.name.clone(),
                     gpu_util_percent: sample.gpu_util_percent,
                     memory_util_percent,
+                    memory_used_bytes: sample.memory_used_bytes,
                     kind: PolicyEventKind::Alert,
                     reason: "idle_still_detected".to_string(),
-                    at: now,
                     state_mutation: StateMutation::RefreshAlert {
                         previous_last_alert_sent_at,
                     },
@@ -140,9 +144,9 @@ impl PolicyEngine {
                         gpu_name: sample.name.clone(),
                         gpu_util_percent: sample.gpu_util_percent,
                         memory_util_percent,
+                        memory_used_bytes: sample.memory_used_bytes,
                         kind: PolicyEventKind::Recovery,
                         reason: "busy_detected".to_string(),
-                        at: now,
                         state_mutation: StateMutation::ClearAlert,
                     });
                 }
@@ -216,6 +220,7 @@ mod tests {
             trigger_mode: TriggerMode::Both,
             trigger_after_consecutive_samples: 3,
             recovery_after_consecutive_samples: 2,
+            repeat_idle_notifications: false,
             resend_cooldown_seconds: 120,
             send_recovery: true,
             suppress_in_quiet_hours: true,
@@ -243,9 +248,25 @@ mod tests {
     }
 
     #[test]
-    fn respects_resend_cooldown() {
+    fn continuous_idle_does_not_resend_by_default() {
         let mut cfg = policy();
         cfg.trigger_after_consecutive_samples = 1;
+        let mut engine = PolicyEngine::new(cfg);
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        assert!(engine.evaluate(&sample(10.0, 20.0), t0).is_some());
+        assert!(
+            engine
+                .evaluate(&sample(12.0, 18.0), t0 + Duration::seconds(300))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn respects_resend_cooldown_when_repeat_enabled() {
+        let mut cfg = policy();
+        cfg.trigger_after_consecutive_samples = 1;
+        cfg.repeat_idle_notifications = true;
         cfg.resend_cooldown_seconds = 60;
         let mut engine = PolicyEngine::new(cfg);
         let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();

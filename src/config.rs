@@ -179,6 +179,7 @@ pub struct NotificationPolicyConfig {
     pub trigger_mode: TriggerMode,
     pub trigger_after_consecutive_samples: u32,
     pub recovery_after_consecutive_samples: u32,
+    pub repeat_idle_notifications: bool,
     pub resend_cooldown_seconds: u64,
     pub send_recovery: bool,
     pub suppress_in_quiet_hours: bool,
@@ -192,7 +193,8 @@ impl Default for NotificationPolicyConfig {
             trigger_mode: TriggerMode::Both,
             trigger_after_consecutive_samples: 3,
             recovery_after_consecutive_samples: 2,
-            resend_cooldown_seconds: 1800,
+            repeat_idle_notifications: false,
+            resend_cooldown_seconds: 3600,
             send_recovery: true,
             suppress_in_quiet_hours: true,
         }
@@ -351,5 +353,6 @@ topic = "my-topic"
         assert_eq!(cfg.policy.trigger_mode, TriggerMode::Both);
         assert_eq!(cfg.policy.gpu_util_percent, 20.0);
         assert_eq!(cfg.policy.memory_util_percent, 20.0);
+        assert!(!cfg.policy.repeat_idle_notifications);
     }
 }

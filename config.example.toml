@@ -42,8 +42,11 @@ trigger_mode = "both"
 trigger_after_consecutive_samples = 3
 # 连续不满足空闲判定样本数达到后触发恢复通知（表示 GPU 再次变忙）
 recovery_after_consecutive_samples = 2
+# 连续空闲期间是否重复提醒（false: 仅首次空闲通知，避免频繁打扰）
+repeat_idle_notifications = false
 # 空闲通知重复发送冷却时间（秒）
-resend_cooldown_seconds = 1800
+# 仅在 repeat_idle_notifications = true 时生效
+resend_cooldown_seconds = 3600
 # 是否发送恢复通知
 send_recovery = true
 # 是否在 quiet_hours 内抑制通知
