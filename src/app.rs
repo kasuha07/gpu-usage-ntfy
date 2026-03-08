@@ -1,9 +1,10 @@
 use crate::config::{AppConfig, NtfyConfig};
 use crate::gpu::GpuSampler;
-use crate::notify::{Notifier, NtfyNotifier};
+use crate::notify::{NotificationRow, Notifier, NtfyNotifier, render_notification, row_from_event};
 use crate::policy::{PolicyEngine, PolicyEvent, PolicyEventKind};
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,7 @@ where
     notifier: Arc<dyn Notifier>,
     notifier_factory: Arc<dyn NotifierFactory>,
     policy_engine: PolicyEngine,
+    last_idle_snapshot_fingerprint: Option<String>,
 }
 
 impl<S> MonitorApp<S>
@@ -63,6 +65,7 @@ where
             notifier,
             notifier_factory,
             policy_engine,
+            last_idle_snapshot_fingerprint: None,
         })
     }
 
@@ -114,14 +117,14 @@ where
 
     pub(crate) async fn poll_once(&mut self) -> Result<()> {
         let samples = self.sampler.sample_all()?;
-        let mut events_to_send = Vec::new();
+        let mut trigger_events = Vec::new();
 
         if samples.is_empty() {
             warn!("no GPU devices found by NVML");
             return Ok(());
         }
 
-        for sample in samples {
+        for sample in &samples {
             let memory_util_percent = sample.memory_util_percent();
 
             if self.config.monitor.sample_log {
@@ -137,7 +140,7 @@ where
                 );
             }
 
-            if let Some(event) = self.policy_engine.evaluate(&sample, Utc::now()) {
+            if let Some(event) = self.policy_engine.evaluate(sample, Utc::now()) {
                 if self.is_quiet_hours_suppressed() {
                     info!(
                         gpu_uuid = %event.gpu_uuid,
@@ -148,26 +151,49 @@ where
                     continue;
                 }
 
-                events_to_send.push(event);
+                trigger_events.push(event);
             }
         }
 
-        if events_to_send.is_empty() {
+        let active_idle_rows =
+            build_active_idle_rows(&self.policy_engine, &samples, &trigger_events);
+        let recovery_rows = build_recovery_rows(&trigger_events);
+        let active_idle_fingerprint = notification_fingerprint(&self.config, &active_idle_rows);
+        let has_alert_trigger = trigger_events
+            .iter()
+            .any(|event| matches!(event.kind, PolicyEventKind::Alert));
+        let has_recovery_trigger = !recovery_rows.is_empty();
+
+        let should_include_idle_summary = !active_idle_rows.is_empty()
+            && (has_recovery_trigger
+                || (has_alert_trigger
+                    && active_idle_fingerprint != self.last_idle_snapshot_fingerprint));
+
+        let mut rows_to_send = Vec::new();
+        if should_include_idle_summary {
+            rows_to_send.extend(active_idle_rows);
+        }
+        rows_to_send.extend(recovery_rows);
+
+        if rows_to_send.is_empty() {
+            self.refresh_last_idle_snapshot_fingerprint(&samples);
             return Ok(());
         }
 
-        if let Err(err) = self.notifier.send_events(&events_to_send).await {
+        if let Err(err) = self.notifier.send_rows(&rows_to_send).await {
             error!(
                 error = ?err,
-                event_count = events_to_send.len(),
+                event_count = trigger_events.len(),
                 "failed to send ntfy notification"
             );
-            for event in &events_to_send {
+            for event in &trigger_events {
                 self.policy_engine.on_notification_not_sent(event);
             }
         } else {
-            info!(event_count = events_to_send.len(), "ntfy notification sent");
+            info!(event_count = trigger_events.len(), "ntfy notification sent");
         }
+
+        self.refresh_last_idle_snapshot_fingerprint(&samples);
 
         Ok(())
     }
@@ -213,6 +239,7 @@ where
             self.notifier = notifier;
         }
         self.policy_engine = PolicyEngine::new(self.config.policy.clone());
+        self.last_idle_snapshot_fingerprint = None;
 
         info!(
             config_path = %self.config_path.display(),
@@ -275,6 +302,69 @@ where
     fn is_quiet_hours_suppressed(&self) -> bool {
         self.config.policy.suppress_in_quiet_hours && self.config.now_in_quiet_hours()
     }
+
+    fn refresh_last_idle_snapshot_fingerprint(&mut self, samples: &[crate::gpu::GpuSample]) {
+        let active_idle_rows = build_active_idle_rows(&self.policy_engine, samples, &[]);
+        self.last_idle_snapshot_fingerprint =
+            notification_fingerprint(&self.config, &active_idle_rows);
+    }
+}
+
+fn notification_fingerprint(config: &AppConfig, rows: &[NotificationRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    Some(render_notification(&config.ntfy, rows).fingerprint())
+}
+
+fn build_active_idle_rows(
+    policy_engine: &PolicyEngine,
+    samples: &[crate::gpu::GpuSample],
+    trigger_events: &[PolicyEvent],
+) -> Vec<NotificationRow> {
+    let alert_reason_by_uuid: HashMap<&str, &str> = trigger_events
+        .iter()
+        .filter(|event| matches!(event.kind, PolicyEventKind::Alert))
+        .map(|event| (event.gpu_uuid.as_str(), event.reason.as_str()))
+        .collect();
+
+    let mut rows = Vec::new();
+
+    for sample in samples {
+        if !policy_engine.is_alert_active(&sample.uuid)
+            || !policy_engine.sample_matches_idle_policy(sample)
+        {
+            continue;
+        }
+
+        rows.push(NotificationRow {
+            gpu_index: sample.index,
+            gpu_uuid: sample.uuid.clone(),
+            gpu_name: sample.name.clone(),
+            gpu_util_percent: sample.gpu_util_percent,
+            memory_used_bytes: sample.memory_used_bytes,
+            kind: PolicyEventKind::Alert,
+            reason: alert_reason_by_uuid
+                .get(sample.uuid.as_str())
+                .copied()
+                .unwrap_or("idle_still_detected")
+                .to_string(),
+        });
+    }
+
+    rows.sort_by_key(|row| row.gpu_index);
+    rows
+}
+
+fn build_recovery_rows(trigger_events: &[PolicyEvent]) -> Vec<NotificationRow> {
+    let mut rows: Vec<_> = trigger_events
+        .iter()
+        .filter(|event| matches!(event.kind, PolicyEventKind::Recovery))
+        .map(row_from_event)
+        .collect();
+    rows.sort_by_key(|row| row.gpu_index);
+    rows
 }
 
 fn bytes_to_mib(bytes: u64) -> f64 {
@@ -374,13 +464,31 @@ mod tests {
 
     #[async_trait]
     impl Notifier for MockNotifier {
-        async fn send_events(&self, events: &[PolicyEvent]) -> Result<()> {
-            let mut calls = self.send_calls.lock().expect("send_calls mutex poisoned");
-            *calls += 1;
+        async fn send_rows(&self, rows: &[NotificationRow]) -> Result<()> {
             self.batch_sizes
                 .lock()
                 .expect("batch_sizes mutex poisoned")
-                .push(events.len());
+                .push(rows.len());
+
+            let payload = render_notification(&NtfyConfig::default(), rows);
+            self.send_text(
+                &payload.title,
+                &payload.body,
+                &payload.tags,
+                payload.priority,
+            )
+            .await
+        }
+
+        async fn send_text(
+            &self,
+            title: &str,
+            body: &str,
+            _tags: &[String],
+            _priority: u8,
+        ) -> Result<()> {
+            let mut calls = self.send_calls.lock().expect("send_calls mutex poisoned");
+            *calls += 1;
 
             let mut fail_first = self
                 .fail_first_send
@@ -392,16 +500,6 @@ mod tests {
                 return Err(anyhow!("injected send failure"));
             }
 
-            Ok(())
-        }
-
-        async fn send_text(
-            &self,
-            title: &str,
-            body: &str,
-            _tags: &[String],
-            _priority: u8,
-        ) -> Result<()> {
             self.text_messages
                 .lock()
                 .expect("text_messages mutex poisoned")
@@ -466,6 +564,33 @@ mod tests {
             name: format!("Test GPU {index}"),
             gpu_util_percent: 5.0,
             memory_used_bytes: 50,
+            memory_total_bytes: 1000,
+        }
+    }
+
+    fn sample_busy_with(index: u32, uuid: &str) -> GpuSample {
+        GpuSample {
+            index,
+            uuid: uuid.to_string(),
+            name: format!("Test GPU {index}"),
+            gpu_util_percent: 95.0,
+            memory_used_bytes: 900,
+            memory_total_bytes: 1000,
+        }
+    }
+
+    fn sample_idle_metrics_with(
+        index: u32,
+        uuid: &str,
+        gpu_util_percent: f64,
+        memory_used_bytes: u64,
+    ) -> GpuSample {
+        GpuSample {
+            index,
+            uuid: uuid.to_string(),
+            name: format!("Test GPU {index}"),
+            gpu_util_percent,
+            memory_used_bytes,
             memory_total_bytes: 1000,
         }
     }
@@ -561,6 +686,167 @@ mod tests {
 
         assert_eq!(notifier.event_calls(), 1);
         assert_eq!(notifier.batch_sizes(), vec![3]);
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].0.contains("[3 GPUs]"));
+        assert!(messages[0].1.contains("5"));
+        assert!(messages[0].1.contains("6"));
+        assert!(messages[0].1.contains("7"));
+    }
+
+    #[tokio::test]
+    async fn later_idle_notification_includes_existing_active_idle_gpus() {
+        let config = base_config();
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_with(6, "GPU-6")],
+            vec![sample_idle_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].0.contains("[GPU6]"));
+        assert!(messages[1].0.contains("[2 GPUs]"));
+        assert!(messages[1].1.contains("4"));
+        assert!(messages[1].1.contains("6"));
+        assert!(messages[1].1.contains("检测到 GPU 空闲"));
+        assert!(messages[1].1.contains("GPU 持续空闲"));
+    }
+
+    #[tokio::test]
+    async fn staggered_idle_gpus_expand_the_summary_instead_of_fragmenting() {
+        let config = base_config();
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_with(6, "GPU-6")],
+            vec![sample_idle_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+            vec![
+                sample_idle_with(4, "GPU-4"),
+                sample_idle_with(6, "GPU-6"),
+                sample_idle_with(8, "GPU-8"),
+            ],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+        app.poll_once().await.expect("third poll should finish");
+
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].0.contains("[GPU6]"));
+        assert!(messages[1].0.contains("[2 GPUs]"));
+        assert!(messages[2].0.contains("[3 GPUs]"));
+        assert!(messages[2].1.contains("4"));
+        assert!(messages[2].1.contains("6"));
+        assert!(messages[2].1.contains("8"));
+    }
+
+    #[tokio::test]
+    async fn identical_aggregated_repeat_notification_is_deduped() {
+        let mut config = base_config();
+        config.policy.repeat_idle_notifications = true;
+        config.policy.resend_cooldown_seconds = 0;
+
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+            vec![sample_idle_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+
+        assert_eq!(notifier.event_calls(), 1);
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].0.contains("[2 GPUs]"));
+    }
+
+    #[tokio::test]
+    async fn repeat_dedupe_ignores_metric_drift_after_summary() {
+        let mut config = base_config();
+        config.policy.repeat_idle_notifications = true;
+        config.policy.resend_cooldown_seconds = 0;
+
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_metrics_with(6, "GPU-6", 1.0, 50)],
+            vec![sample_idle_metrics_with(6, "GPU-6", 12.0, 120)],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+
+        assert_eq!(notifier.event_calls(), 1);
+        assert_eq!(notifier.text_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_resets_after_alerts_clear_without_recovery_notification() {
+        let mut config = base_config();
+        config.policy.repeat_idle_notifications = true;
+        config.policy.resend_cooldown_seconds = 0;
+        config.policy.send_recovery = false;
+
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_with(6, "GPU-6")],
+            vec![sample_busy_with(6, "GPU-6")],
+            vec![sample_idle_with(6, "GPU-6")],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+        app.poll_once().await.expect("third poll should finish");
+
+        assert_eq!(notifier.event_calls(), 2);
+        assert_eq!(notifier.text_messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_notification_can_include_remaining_idle_gpu_summary() {
+        let config = base_config();
+        let config_path = write_temp_config("[ntfy]\ntopic = \"gpu-topic\"\n");
+        let sampler = SequenceSampler::new(vec![
+            vec![sample_idle_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+            vec![sample_busy_with(4, "GPU-4"), sample_idle_with(6, "GPU-6")],
+        ]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+        let mut app = MonitorApp::new(config_path, config, sampler, Arc::new(factory))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        app.poll_once().await.expect("second poll should finish");
+
+        let messages = notifier.text_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].0.contains("状态更新"));
+        assert!(messages[1].1.contains("GPU 已恢复繁忙"));
+        assert!(messages[1].1.contains("GPU 持续空闲"));
     }
 
     #[tokio::test]

@@ -9,9 +9,15 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    async fn send_events(&self, events: &[PolicyEvent]) -> Result<()>;
+    async fn send_rows(&self, rows: &[NotificationRow]) -> Result<()>;
+
+    async fn send_events(&self, events: &[PolicyEvent]) -> Result<()> {
+        self.send_rows(&rows_from_events(events)).await
+    }
+
     async fn send_text(&self, title: &str, body: &str, tags: &[String], priority: u8)
     -> Result<()>;
 }
@@ -20,6 +26,32 @@ pub trait Notifier: Send + Sync {
 pub struct NtfyNotifier {
     client: Client,
     config: NtfyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotificationRow {
+    pub gpu_index: u32,
+    pub gpu_uuid: String,
+    pub gpu_name: String,
+    pub gpu_util_percent: f64,
+    pub memory_used_bytes: u64,
+    pub kind: PolicyEventKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationPayload {
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    pub priority: u8,
+    fingerprint: String,
+}
+
+impl NotificationPayload {
+    pub fn fingerprint(&self) -> String {
+        self.fingerprint.clone()
+    }
 }
 
 impl NtfyNotifier {
@@ -91,12 +123,19 @@ impl NtfyNotifier {
 
 #[async_trait]
 impl Notifier for NtfyNotifier {
-    async fn send_events(&self, events: &[PolicyEvent]) -> Result<()> {
-        if events.is_empty() {
+    async fn send_rows(&self, rows: &[NotificationRow]) -> Result<()> {
+        if rows.is_empty() {
             return Ok(());
         }
-        let (title, body, tags, priority) = format_events_notification(&self.config, events);
-        self.publish(&title, &body, &tags, priority).await
+
+        let payload = render_notification(&self.config, rows);
+        self.publish(
+            &payload.title,
+            &payload.body,
+            &payload.tags,
+            payload.priority,
+        )
+        .await
     }
 
     async fn send_text(
@@ -108,6 +147,27 @@ impl Notifier for NtfyNotifier {
     ) -> Result<()> {
         self.publish(title, body, tags, priority).await
     }
+}
+
+pub fn row_from_event(event: &PolicyEvent) -> NotificationRow {
+    NotificationRow {
+        gpu_index: event.gpu_index,
+        gpu_uuid: event.gpu_uuid.clone(),
+        gpu_name: event.gpu_name.clone(),
+        gpu_util_percent: event.gpu_util_percent,
+        memory_used_bytes: event.memory_used_bytes,
+        kind: event.kind.clone(),
+        reason: event.reason.clone(),
+    }
+}
+
+pub fn rows_from_events(events: &[PolicyEvent]) -> Vec<NotificationRow> {
+    events.iter().map(row_from_event).collect()
+}
+
+#[cfg(test)]
+pub fn payload_from_events(config: &NtfyConfig, events: &[PolicyEvent]) -> NotificationPayload {
+    render_notification(config, &rows_from_events(events))
 }
 
 pub(crate) fn build_publish_request(
@@ -196,16 +256,13 @@ fn build_http_error(status: StatusCode, message: &str, config: &NtfyConfig) -> a
     anyhow!("ntfy request failed with status {}: {}", status, message)
 }
 
-fn format_events_notification(
-    config: &NtfyConfig,
-    events: &[PolicyEvent],
-) -> (String, String, Vec<String>, u8) {
-    let has_alert = events
+pub fn render_notification(config: &NtfyConfig, rows: &[NotificationRow]) -> NotificationPayload {
+    let has_alert = rows
         .iter()
-        .any(|event| matches!(event.kind, PolicyEventKind::Alert));
-    let has_recovery = events
+        .any(|row| matches!(row.kind, PolicyEventKind::Alert));
+    let has_recovery = rows
         .iter()
-        .any(|event| matches!(event.kind, PolicyEventKind::Recovery));
+        .any(|row| matches!(row.kind, PolicyEventKind::Recovery));
 
     let status_text = match (has_alert, has_recovery) {
         (true, false) => "空闲",
@@ -213,21 +270,21 @@ fn format_events_notification(
         _ => "状态更新",
     };
 
-    let title = if events.len() == 1 {
+    let title = if rows.len() == 1 {
         format!(
             "{} [GPU{}] {}",
-            config.title_prefix, events[0].gpu_index, status_text
+            config.title_prefix, rows[0].gpu_index, status_text
         )
     } else {
         format!(
             "{} [{} GPUs] {}",
             config.title_prefix,
-            events.len(),
+            rows.len(),
             status_text
         )
     };
 
-    let body = format_events_markdown_table(events);
+    let body = format_events_markdown_table(rows);
 
     let mut tags = config.tags.clone();
     if has_alert {
@@ -236,6 +293,7 @@ fn format_events_notification(
     if has_recovery {
         tags.push("busy".to_string());
     }
+    let tags = dedup_tags(tags);
 
     let priority = if has_alert {
         config.priority
@@ -243,12 +301,30 @@ fn format_events_notification(
         config.priority.saturating_sub(1).max(1)
     };
 
-    (title, body, dedup_tags(tags), priority)
+    let mut signature_parts = rows
+        .iter()
+        .map(|row| {
+            let kind = match row.kind {
+                PolicyEventKind::Alert => "alert",
+                PolicyEventKind::Recovery => "recovery",
+            };
+            format!("{}:{}", kind, row.gpu_uuid)
+        })
+        .collect::<Vec<_>>();
+    signature_parts.sort();
+
+    NotificationPayload {
+        title,
+        body,
+        tags,
+        priority,
+        fingerprint: signature_parts.join("|"),
+    }
 }
 
-fn format_events_markdown_table(events: &[PolicyEvent]) -> String {
-    let mut ordered: Vec<&PolicyEvent> = events.iter().collect();
-    ordered.sort_by_key(|event| event.gpu_index);
+fn format_events_markdown_table(rows: &[NotificationRow]) -> String {
+    let mut ordered: Vec<&NotificationRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.gpu_index);
 
     let headers = [
         "GPU序号",
@@ -259,16 +335,16 @@ fn format_events_markdown_table(events: &[PolicyEvent]) -> String {
         "原因",
     ];
 
-    let mut rows: Vec<[String; 6]> = Vec::with_capacity(ordered.len());
-    for event in ordered {
-        let (status_text, _) = localized_status_and_tag(&event.kind);
-        rows.push([
-            event.gpu_index.to_string(),
-            escape_table_cell(&abbreviate_gpu_name(&event.gpu_name)),
+    let mut table_rows: Vec<[String; 6]> = Vec::with_capacity(ordered.len());
+    for row in ordered {
+        let (status_text, _) = localized_status_and_tag(&row.kind);
+        table_rows.push([
+            row.gpu_index.to_string(),
+            escape_table_cell(&abbreviate_gpu_name(&row.gpu_name)),
             status_text.to_string(),
-            format!("{:.2}%", event.gpu_util_percent),
-            format!("{:.2}", bytes_to_gb(event.memory_used_bytes)),
-            escape_table_cell(localize_reason(event.reason.as_str())),
+            format!("{:.2}%", row.gpu_util_percent),
+            format!("{:.2}", bytes_to_gb(row.memory_used_bytes)),
+            escape_table_cell(localize_reason(row.reason.as_str())),
         ]);
     }
 
@@ -280,7 +356,7 @@ fn format_events_markdown_table(events: &[PolicyEvent]) -> String {
         headers[4].chars().count(),
         headers[5].chars().count(),
     ];
-    for row in &rows {
+    for row in &table_rows {
         for (idx, cell) in row.iter().enumerate() {
             widths[idx] = widths[idx].max(cell.chars().count());
         }
@@ -297,7 +373,8 @@ fn format_events_markdown_table(events: &[PolicyEvent]) -> String {
         .iter()
         .map(|w| "-".repeat(*w))
         .collect::<Vec<_>>()
-        .join("-|-");
+        .join("-|- ")
+        .replace(" ", "");
 
     let mut lines = vec![
         "### GPU 状态明细".to_string(),
@@ -305,7 +382,7 @@ fn format_events_markdown_table(events: &[PolicyEvent]) -> String {
         header_line,
         separator_line,
     ];
-    for row in rows {
+    for row in table_rows {
         lines.push(
             row.iter()
                 .enumerate()
@@ -544,23 +621,23 @@ mod tests {
     fn markdown_body_uses_table_format_and_memory_gb() {
         let event = build_idle_event(2, "GPU-2");
         let ntfy_cfg = test_config();
-        let (title, body, tags, _priority) = format_events_notification(&ntfy_cfg, &[event]);
+        let payload = payload_from_events(&ntfy_cfg, &[event]);
 
-        assert!(title.contains("[GPU2]"));
-        assert!(body.contains("### GPU 状态明细"));
-        assert!(body.contains("```"));
-        assert!(body.contains("GPU序号"));
-        assert!(body.contains("GPU型号"));
-        assert!(body.contains("核心利用率"));
-        assert!(body.contains("已使用显存(GB)"));
-        assert!(body.contains("2"));
-        assert!(body.contains("RTX 4090"));
-        assert!(body.contains("0.00%"));
-        assert!(body.contains("检测到 GPU 空闲"));
-        assert!(!body.contains("| ---: |"));
-        assert!(!body.contains("时间"));
-        assert!(!body.contains("+08:00"));
-        assert_eq!(tags, vec!["gpu".to_string(), "idle".to_string()]);
+        assert!(payload.title.contains("[GPU2]"));
+        assert!(payload.body.contains("### GPU 状态明细"));
+        assert!(payload.body.contains("```"));
+        assert!(payload.body.contains("GPU序号"));
+        assert!(payload.body.contains("GPU型号"));
+        assert!(payload.body.contains("核心利用率"));
+        assert!(payload.body.contains("已使用显存(GB)"));
+        assert!(payload.body.contains("2"));
+        assert!(payload.body.contains("RTX 4090"));
+        assert!(payload.body.contains("0.00%"));
+        assert!(payload.body.contains("检测到 GPU 空闲"));
+        assert!(!payload.body.contains("| ---: |"));
+        assert!(!payload.body.contains("时间"));
+        assert!(!payload.body.contains("+08:00"));
+        assert_eq!(payload.tags, vec!["gpu".to_string(), "idle".to_string()]);
     }
 
     #[test]
@@ -570,16 +647,26 @@ mod tests {
         let mut ntfy_cfg = test_config();
         ntfy_cfg.tags = vec!["idle".to_string(), "gpu".to_string()];
 
-        let (title, body, tags, _priority) =
-            format_events_notification(&ntfy_cfg, &[event7, event5]);
+        let payload = payload_from_events(&ntfy_cfg, &[event7, event5]);
 
-        assert!(title.contains("[2 GPUs]"));
-        assert!(body.contains("```"));
-        assert!(body.contains("GPU序号"));
-        assert!(body.contains("5"));
-        assert!(body.contains("7"));
-        assert_eq!(body.matches("RTX 4090").count(), 2);
-        assert!(!body.contains("时间"));
-        assert_eq!(tags, vec!["idle".to_string(), "gpu".to_string()]);
+        assert!(payload.title.contains("[2 GPUs]"));
+        assert!(payload.body.contains("```"));
+        assert!(payload.body.contains("GPU序号"));
+        assert!(payload.body.contains("5"));
+        assert!(payload.body.contains("7"));
+        assert_eq!(payload.body.matches("RTX 4090").count(), 2);
+        assert_eq!(payload.tags, vec!["idle".to_string(), "gpu".to_string()]);
+    }
+
+    #[test]
+    fn notification_payload_fingerprint_changes_with_rendered_summary() {
+        let event5 = build_idle_event(5, "GPU-5");
+        let event7 = build_idle_event(7, "GPU-7");
+        let config = test_config();
+
+        let payload1 = payload_from_events(&config, &[event5]);
+        let payload2 = payload_from_events(&config, &[event7]);
+
+        assert_ne!(payload1.fingerprint(), payload2.fingerprint());
     }
 }

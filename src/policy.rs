@@ -22,6 +22,7 @@ pub struct PolicyEvent {
     state_mutation: StateMutation,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 enum StateMutation {
     ActivateAlert {
@@ -54,15 +55,29 @@ impl PolicyEngine {
         }
     }
 
-    pub fn evaluate(&mut self, sample: &GpuSample, now: DateTime<Utc>) -> Option<PolicyEvent> {
-        let memory_util_percent = sample.memory_util_percent();
-        let gpu_is_idle = sample.gpu_util_percent <= self.config.gpu_util_percent;
+    pub fn is_alert_active(&self, gpu_uuid: &str) -> bool {
+        self.states
+            .get(gpu_uuid)
+            .is_some_and(|state| state.alert_active)
+    }
+
+    pub fn sample_matches_idle_policy(&self, sample: &GpuSample) -> bool {
+        self.matches_idle_metrics(sample.gpu_util_percent, sample.memory_util_percent())
+    }
+
+    fn matches_idle_metrics(&self, gpu_util_percent: f64, memory_util_percent: f64) -> bool {
+        let gpu_is_idle = gpu_util_percent <= self.config.gpu_util_percent;
         let memory_is_idle = memory_util_percent <= self.config.memory_util_percent;
 
-        let is_idle = match self.config.trigger_mode {
+        match self.config.trigger_mode {
             TriggerMode::Any => gpu_is_idle || memory_is_idle,
             TriggerMode::Both => gpu_is_idle && memory_is_idle,
-        };
+        }
+    }
+
+    pub fn evaluate(&mut self, sample: &GpuSample, now: DateTime<Utc>) -> Option<PolicyEvent> {
+        let memory_util_percent = sample.memory_util_percent();
+        let is_idle = self.matches_idle_metrics(sample.gpu_util_percent, memory_util_percent);
 
         let state = self.states.entry(sample.uuid.clone()).or_default();
 
@@ -169,7 +184,7 @@ impl PolicyEngine {
                 previous_last_alert_sent_at,
             } => {
                 state.alert_active = false;
-                state.last_alert_sent_at = previous_last_alert_sent_at.clone();
+                state.last_alert_sent_at = *previous_last_alert_sent_at;
                 state.non_matching_count = 0;
                 state.matching_count = self
                     .config
@@ -179,7 +194,7 @@ impl PolicyEngine {
             StateMutation::RefreshAlert {
                 previous_last_alert_sent_at,
             } => {
-                state.last_alert_sent_at = previous_last_alert_sent_at.clone();
+                state.last_alert_sent_at = *previous_last_alert_sent_at;
             }
             StateMutation::ClearAlert => {
                 state.alert_active = true;
@@ -203,10 +218,19 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn sample(gpu_util_percent: f64, memory_util_percent: f64) -> GpuSample {
+        sample_with(0, "GPU-TEST", gpu_util_percent, memory_util_percent)
+    }
+
+    fn sample_with(
+        index: u32,
+        uuid: &str,
+        gpu_util_percent: f64,
+        memory_util_percent: f64,
+    ) -> GpuSample {
         GpuSample {
-            index: 0,
-            uuid: "GPU-TEST".to_string(),
-            name: "Test GPU".to_string(),
+            index,
+            uuid: uuid.to_string(),
+            name: format!("Test GPU {index}"),
             gpu_util_percent,
             memory_used_bytes: (memory_util_percent * 10.0) as u64,
             memory_total_bytes: 1000,
