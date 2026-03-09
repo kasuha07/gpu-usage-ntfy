@@ -14,24 +14,13 @@ use tracing::warn;
 
 const SUPPORTED_NTFY_TOKEN_ENV: &str = "NTFY_TOKEN";
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub monitor: MonitorConfig,
     pub ntfy: NtfyConfig,
     pub quiet_hours: Vec<QuietWindow>,
     pub policy: NotificationPolicyConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            monitor: MonitorConfig::default(),
-            ntfy: NtfyConfig::default(),
-            quiet_hours: Vec::new(),
-            policy: NotificationPolicyConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -99,6 +88,10 @@ impl AppConfig {
             bail!("ntfy.priority must be in [1, 5]");
         }
 
+        if self.ntfy.timeout_seconds == 0 {
+            bail!("ntfy.timeout_seconds must be > 0");
+        }
+
         if self.ntfy.max_retries == 0 {
             bail!("ntfy.max_retries must be > 0");
         }
@@ -145,6 +138,14 @@ impl AppConfig {
 
         if url.host_str().is_none() {
             bail!("ntfy.server must include a host");
+        }
+
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("ntfy.server must not embed credentials in URL");
+        }
+
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("ntfy.server must not include query parameters or fragments");
         }
 
         match url.scheme() {
@@ -488,5 +489,47 @@ allow_insecure_http = true
         let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         cfg.resolve_from_env().unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        let raw = r#"
+[ntfy]
+topic = "my-topic"
+timeout_seconds = 0
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.resolve_from_env().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ntfy.timeout_seconds must be > 0"));
+    }
+
+    #[test]
+    fn rejects_server_urls_with_embedded_credentials() {
+        let raw = r#"
+[ntfy]
+server = "https://user:pass@ntfy.example.com"
+topic = "my-topic"
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.resolve_from_env().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must not embed credentials"));
+    }
+
+    #[test]
+    fn rejects_server_urls_with_query_or_fragment() {
+        let raw = r#"
+[ntfy]
+server = "https://ntfy.example.com/base?foo=bar#frag"
+topic = "my-topic"
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.resolve_from_env().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must not include query parameters or fragments"));
     }
 }
