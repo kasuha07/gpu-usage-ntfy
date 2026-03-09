@@ -4,10 +4,11 @@ on:
   push:
     tags:
       - "v*"
+      - "gpu-usage-ntfy-v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release (for example: v0.1.1)"
+        description: "Existing tag to release (for example: v0.1.1 or gpu-usage-ntfy-v0.2.0)"
         required: true
         type: string
 
@@ -29,16 +30,23 @@ jobs:
             tag="${{ inputs.tag }}"
           fi
 
-          if [[ -z "${tag}" || "${tag}" != v* ]]; then
-            echo "Tag must start with v, got: ${tag:-<empty>}" >&2
+          if [[ -z "${tag}" ]]; then
+            echo "Tag must not be empty" >&2
             exit 1
           fi
 
-          package_dir="gpu-usage-ntfy-${tag}-x86_64-unknown-linux-gnu"
+          package_tag="${tag#gpu-usage-ntfy-}"
+          if [[ "${tag}" != v* && "${tag}" != gpu-usage-ntfy-v* ]]; then
+            echo "Tag must start with v or gpu-usage-ntfy-v, got: ${tag}" >&2
+            exit 1
+          fi
+
+          package_dir="gpu-usage-ntfy-${package_tag}-x86_64-unknown-linux-gnu"
           archive="${package_dir}.tar.gz"
           checksum="${archive}.sha256"
 
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "package_tag=${package_tag}" >> "${GITHUB_OUTPUT}"
           echo "package_dir=${package_dir}" >> "${GITHUB_OUTPUT}"
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
           echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
@@ -61,9 +69,14 @@ jobs:
         with:
           script: |
             const tag = process.env.TAG;
+            const isSupportedTag =
+              typeof tag === 'string' &&
+              (tag.startsWith('v') || tag.startsWith('gpu-usage-ntfy-v'));
 
-            if (!tag || !tag.startsWith('v')) {
-              core.setFailed(`Tag must start with v. Received: ${tag ?? '(empty)'}`);
+            if (!isSupportedTag) {
+              core.setFailed(
+                `Tag must start with v or gpu-usage-ntfy-v. Received: ${tag ?? '(empty)'}`,
+              );
               return;
             }
 

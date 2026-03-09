@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0](https://github.com/kasuha07/gpu-usage-ntfy/compare/gpu-usage-ntfy-v0.1.0...gpu-usage-ntfy-v0.2.0) (2026-03-09)
+## [0.2.0](https://github.com/kasuha07/gpu-usage-ntfy/compare/v0.1.0...gpu-usage-ntfy-v0.2.0) (2026-03-09)
 
 
 ### Features
