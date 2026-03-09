@@ -55,7 +55,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Create GitHub release if missing
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TAG: ${{ steps.meta.outputs.tag }}
         with:
