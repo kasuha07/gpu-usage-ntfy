@@ -16,7 +16,75 @@ jobs:
 
     steps:
       - name: Run release-please
+        id: release
         uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Checkout released source
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+
+      - name: Resolve release package metadata
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        id: package
+        shell: bash
+        run: |
+          tag="${{ steps.release.outputs.tag_name }}"
+          package_tag="${tag#gpu-usage-ntfy-}"
+
+          package_dir="gpu-usage-ntfy-${package_tag}-x86_64-unknown-linux-gnu"
+          archive="${package_dir}.tar.gz"
+          checksum="${archive}.sha256"
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "package_dir=${package_dir}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: cargo build --release --locked
+
+      - name: Package release artifacts
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        shell: bash
+        run: |
+          pkg_dir="${{ steps.package.outputs.package_dir }}"
+          mkdir -p "${pkg_dir}"
+
+          cp target/release/gpu-usage-ntfy "${pkg_dir}/"
+          cp README.md LICENSE config.example.toml "${pkg_dir}/"
+
+          tar -czf "${{ steps.package.outputs.archive }}" "${pkg_dir}"
+          sha256sum "${{ steps.package.outputs.archive }}" > "${{ steps.package.outputs.checksum }}"
+
+      - name: Upload workflow artifacts
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.package_dir }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+
+      - name: Upload release assets
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.package.outputs.tag }}" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.checksum }}" \
+            --clobber
