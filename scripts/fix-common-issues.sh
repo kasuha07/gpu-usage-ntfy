@@ -21,6 +21,10 @@ warn() { echo "[WARN] $*"; }
 info() { echo "[INFO] $*"; }
 section() { echo; echo "=== $* ==="; }
 
+shell_quote() {
+  printf '%q' "$1"
+}
+
 sed_escape_replacement() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\\\&/g'
 }
@@ -139,8 +143,10 @@ ensure_release_binary() {
 
   info 'release binary missing; building it now'
   local build_user="${SUDO_USER:-}"
+  local quoted_root_dir
+  quoted_root_dir="$(shell_quote "$ROOT_DIR")"
   if [[ -n "$build_user" && "$build_user" != "root" ]]; then
-    su - "$build_user" -c "cd '$ROOT_DIR' && cargo build --release"
+    su - "$build_user" -c "cd $quoted_root_dir && cargo build --release"
   else
     cd "$ROOT_DIR"
     cargo build --release

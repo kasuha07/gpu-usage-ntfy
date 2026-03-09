@@ -6,6 +6,10 @@ SESSION_NAME="${1:-gpu-usage-ntfy}"
 CONFIG_PATH="${2:-$ROOT_DIR/config.toml}"
 TMUX_SOCKET="${TMUX_SOCKET:-gpu-usage-ntfy}"
 
+shell_quote() {
+  printf '%q' "$1"
+}
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is not installed" >&2
   exit 1
@@ -18,7 +22,9 @@ if tmux -L "$TMUX_SOCKET" list-sessions >/dev/null 2>&1; then
   exit 1
 fi
 
-CMD="cd '$ROOT_DIR' && exec ./scripts/run-monitor.sh '$CONFIG_PATH'"
+printf -v CMD 'cd %s && exec ./scripts/run-monitor.sh %s' \
+  "$(shell_quote "$ROOT_DIR")" \
+  "$(shell_quote "$CONFIG_PATH")"
 tmux -L "$TMUX_SOCKET" new-session -d -s "$SESSION_NAME" "$CMD"
 
 echo "started session '$SESSION_NAME' on tmux socket '$TMUX_SOCKET'"

@@ -13,9 +13,9 @@ Restart=always
 RestartSec=5
 UMask=0077
 NoNewPrivileges=true
+RestrictSUIDSGID=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=__ROOT_DIR__
 
 [Install]
 WantedBy=multi-user.target
