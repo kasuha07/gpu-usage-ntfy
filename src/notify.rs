@@ -3,11 +3,13 @@ use crate::policy::{PolicyEvent, PolicyEventKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::{Client, Request, StatusCode};
+use reqwest::redirect::Policy as RedirectPolicy;
+use reqwest::{Client, Request, StatusCode, Url};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
+use unicode_width::UnicodeWidthStr;
 
 #[allow(dead_code)]
 #[async_trait]
@@ -58,6 +60,7 @@ impl NtfyNotifier {
     pub fn new(config: NtfyConfig) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
+            .redirect(RedirectPolicy::none())
             .build()
             .context("failed to build reqwest client")?;
 
@@ -66,7 +69,9 @@ impl NtfyNotifier {
 
     #[cfg(test)]
     fn topic_url(&self) -> String {
-        format!("{}/{}", self.config.server, self.config.topic)
+        build_topic_url(&self.config)
+            .expect("topic URL should be valid")
+            .to_string()
     }
 
     fn build_publish_request(
@@ -185,7 +190,7 @@ pub(crate) fn build_publish_request(
 
     headers.insert(
         "X-Title",
-        HeaderValue::from_str(title).context("invalid title header for ntfy request")?,
+        header_value_from_utf8(title).context("invalid title header for ntfy request")?,
     );
 
     headers.insert(
@@ -197,7 +202,7 @@ pub(crate) fn build_publish_request(
     if !tags.is_empty() {
         headers.insert(
             "X-Tags",
-            HeaderValue::from_str(&tags.join(","))
+            header_value_from_utf8(&tags.join(","))
                 .context("invalid tags header for ntfy request")?,
         );
     }
@@ -211,18 +216,28 @@ pub(crate) fn build_publish_request(
         );
     }
 
+    let topic_url = build_topic_url(config)?;
     let request = client
-        .post(format!(
-            "{}/{}",
-            config.server.trim_end_matches('/'),
-            config.topic
-        ))
+        .post(topic_url)
         .headers(headers)
         .body(body.to_string())
         .build()
         .context("failed to build ntfy request")?;
 
     Ok(request)
+}
+
+fn build_topic_url(config: &NtfyConfig) -> Result<Url> {
+    let mut url = Url::parse(config.server.trim_end_matches('/'))
+        .context("invalid ntfy.server URL for request")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("ntfy.server URL cannot be a base for topic publishing"))?
+        .push(config.topic.trim());
+    Ok(url)
+}
+
+fn header_value_from_utf8(value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_bytes(value.as_bytes()).context("header contains invalid bytes")
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -349,20 +364,20 @@ fn format_events_markdown_table(rows: &[NotificationRow]) -> String {
     }
 
     let mut widths = [
-        headers[0].chars().count(),
-        headers[1].chars().count(),
-        headers[2].chars().count(),
-        headers[3].chars().count(),
-        headers[4].chars().count(),
-        headers[5].chars().count(),
+        display_width(headers[0]),
+        display_width(headers[1]),
+        display_width(headers[2]),
+        display_width(headers[3]),
+        display_width(headers[4]),
+        display_width(headers[5]),
     ];
     for row in &table_rows {
         for (idx, cell) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(cell.chars().count());
+            widths[idx] = widths[idx].max(display_width(cell));
         }
     }
 
-    let pad = |cell: &str, width: usize| format!("{cell:<width$}", width = width);
+    let pad = |cell: &str, width: usize| pad_display_width(cell, width);
     let header_line = headers
         .iter()
         .enumerate()
@@ -398,6 +413,15 @@ fn format_events_markdown_table(rows: &[NotificationRow]) -> String {
 
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn pad_display_width(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 fn dedup_tags(tags: Vec<String>) -> Vec<String> {
@@ -522,6 +546,44 @@ mod tests {
     }
 
     #[test]
+    fn build_request_allows_utf8_title_and_tags() {
+        let client = Client::new();
+        let config = test_config();
+        let request = build_publish_request(
+            &client,
+            &config,
+            "GPU 监控",
+            "world",
+            &["空闲".to_string(), "恢复".to_string()],
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get("X-Title").unwrap().as_bytes(),
+            "GPU 监控".as_bytes()
+        );
+        assert_eq!(
+            request.headers().get("X-Tags").unwrap().as_bytes(),
+            "空闲,恢复".as_bytes()
+        );
+    }
+
+    #[test]
+    fn build_request_encodes_topic_as_single_path_segment() {
+        let client = Client::new();
+        let mut config = test_config();
+        config.server = "https://ntfy.example.com/base".to_string();
+        config.topic = "gpu/topic?prod".to_string();
+
+        let request = build_publish_request(&client, &config, "hello", "world", &[], 3).unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://ntfy.example.com/base/gpu%2Ftopic%3Fprod"
+        );
+    }
+
+    #[test]
     fn build_request_skips_optional_headers_when_empty() {
         let client = Client::new();
         let mut config = test_config();
@@ -588,6 +650,10 @@ mod tests {
         );
     }
 
+    fn split_table_line(line: &str) -> Vec<&str> {
+        line.split(" | ").collect()
+    }
+
     fn build_policy_engine() -> PolicyEngine {
         PolicyEngine::new(NotificationPolicyConfig {
             gpu_util_percent: 20.0,
@@ -639,6 +705,52 @@ mod tests {
         assert!(!payload.body.contains("时间"));
         assert!(!payload.body.contains("+08:00"));
         assert_eq!(payload.tags, vec!["gpu".to_string(), "idle".to_string()]);
+    }
+
+    #[test]
+    fn markdown_table_padding_uses_display_width_for_cjk_text() {
+        let body = format_events_markdown_table(&[
+            NotificationRow {
+                gpu_index: 2,
+                gpu_uuid: "GPU-2".to_string(),
+                gpu_name: "NVIDIA GeForce RTX 4090".to_string(),
+                gpu_util_percent: 0.0,
+                memory_used_bytes: 7_320_000_000,
+                kind: PolicyEventKind::Recovery,
+                reason: "busy_detected".to_string(),
+            },
+            NotificationRow {
+                gpu_index: 4,
+                gpu_uuid: "GPU-4".to_string(),
+                gpu_name: "NVIDIA GeForce RTX 4090".to_string(),
+                gpu_util_percent: 0.0,
+                memory_used_bytes: 620_000_000,
+                kind: PolicyEventKind::Alert,
+                reason: "idle_still_detected".to_string(),
+            },
+        ]);
+
+        let code_block_lines = body
+            .lines()
+            .skip_while(|line| *line != "```")
+            .skip(1)
+            .take_while(|line| *line != "```")
+            .collect::<Vec<_>>();
+
+        assert!(code_block_lines.len() >= 4);
+
+        let expected_widths = split_table_line(code_block_lines[0])
+            .iter()
+            .map(|cell| display_width(cell))
+            .collect::<Vec<_>>();
+
+        for line in code_block_lines.iter().skip(2) {
+            let widths = split_table_line(line)
+                .iter()
+                .map(|cell| display_width(cell))
+                .collect::<Vec<_>>();
+            assert_eq!(widths, expected_widths, "line was: {line}");
+        }
     }
 
     #[test]
