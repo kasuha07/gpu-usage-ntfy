@@ -5,8 +5,8 @@
 interval_seconds = 10
 # 启动时发送系统通知（Ctrl+C 退出时仍会发送退出通知）
 send_startup_notification = true
-# 输出每次采样日志
-sample_log = true
+# 输出每次采样日志（默认关闭，仅建议排障时开启）
+sample_log = false
 
 [ntfy]
 # 可替换为自建 ntfy 服务器地址

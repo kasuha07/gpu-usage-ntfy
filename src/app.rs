@@ -1,10 +1,11 @@
 use crate::config::{AppConfig, NtfyConfig};
 use crate::gpu::GpuSampler;
-use crate::notify::{NotificationRow, Notifier, NtfyNotifier, render_notification, row_from_event};
+use crate::notify::{NotificationRow, Notifier, NtfyNotifier, row_from_event, rows_fingerprint};
 use crate::policy::{PolicyEngine, PolicyEvent, PolicyEventKind};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,8 @@ where
     S: GpuSampler,
 {
     config_path: PathBuf,
+    config_raw: String,
+    last_failed_config_raw: Option<String>,
     config: AppConfig,
     sampler: S,
     notifier: Arc<dyn Notifier>,
@@ -57,9 +60,13 @@ where
     ) -> Result<Self> {
         let notifier = notifier_factory.build(config.ntfy.clone())?;
         let policy_engine = PolicyEngine::new(config.policy.clone());
+        let config_path = config_path.as_ref().to_path_buf();
+        let config_raw = fs::read_to_string(&config_path)?;
 
         Ok(Self {
-            config_path: config_path.as_ref().to_path_buf(),
+            config_path,
+            config_raw,
+            last_failed_config_raw: None,
             config,
             sampler,
             notifier,
@@ -118,6 +125,9 @@ where
     pub(crate) async fn poll_once(&mut self) -> Result<()> {
         let samples = self.sampler.sample_all()?;
         let mut trigger_events = Vec::new();
+        let now = Utc::now();
+        let quiet_hours_suppressed = self.config.policy.suppress_in_quiet_hours
+            && self.config.now_in_quiet_hours_at(now.clone());
 
         if samples.is_empty() {
             warn!("no GPU devices found by NVML");
@@ -132,16 +142,16 @@ where
                     gpu_index = sample.index,
                     gpu_uuid = %sample.uuid,
                     gpu_name = %sample.name,
-                    gpu_util_percent = format!("{:.2}", sample.gpu_util_percent),
-                    memory_util_percent = format!("{:.2}", memory_util_percent),
+                    gpu_util_percent = sample.gpu_util_percent,
+                    memory_util_percent,
                     memory_used_mib = bytes_to_mib(sample.memory_used_bytes),
                     memory_total_mib = bytes_to_mib(sample.memory_total_bytes),
                     "gpu sample"
                 );
             }
 
-            if let Some(event) = self.policy_engine.evaluate(sample, Utc::now()) {
-                if self.is_quiet_hours_suppressed() {
+            if let Some(event) = self.policy_engine.evaluate(sample, now.clone()) {
+                if quiet_hours_suppressed {
                     info!(
                         gpu_uuid = %event.gpu_uuid,
                         event_kind = ?event.kind,
@@ -157,8 +167,8 @@ where
 
         let active_idle_rows =
             build_active_idle_rows(&self.policy_engine, &samples, &trigger_events);
+        let active_idle_fingerprint = notification_fingerprint(&active_idle_rows);
         let recovery_rows = build_recovery_rows(&trigger_events);
-        let active_idle_fingerprint = notification_fingerprint(&self.config, &active_idle_rows);
         let has_alert_trigger = trigger_events
             .iter()
             .any(|event| matches!(event.kind, PolicyEventKind::Alert));
@@ -169,14 +179,14 @@ where
                 || (has_alert_trigger
                     && active_idle_fingerprint != self.last_idle_snapshot_fingerprint));
 
-        let mut rows_to_send = Vec::new();
+        let mut rows_to_send = Vec::with_capacity(active_idle_rows.len() + recovery_rows.len());
         if should_include_idle_summary {
             rows_to_send.extend(active_idle_rows);
         }
         rows_to_send.extend(recovery_rows);
 
         if rows_to_send.is_empty() {
-            self.refresh_last_idle_snapshot_fingerprint(&samples);
+            self.last_idle_snapshot_fingerprint = active_idle_fingerprint;
             return Ok(());
         }
 
@@ -189,19 +199,38 @@ where
             for event in &trigger_events {
                 self.policy_engine.on_notification_not_sent(event);
             }
+            self.last_idle_snapshot_fingerprint = notification_fingerprint(
+                &build_active_idle_rows(&self.policy_engine, &samples, &[]),
+            );
         } else {
             info!(event_count = trigger_events.len(), "ntfy notification sent");
+            self.last_idle_snapshot_fingerprint = active_idle_fingerprint;
         }
-
-        self.refresh_last_idle_snapshot_fingerprint(&samples);
 
         Ok(())
     }
 
     fn try_reload_config(&mut self) -> ReloadOutcome {
-        let new_config = match AppConfig::load(&self.config_path) {
+        let raw = match fs::read_to_string(&self.config_path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(
+                    config_path = %self.config_path.display(),
+                    error = ?err,
+                    "failed to read config for reload, keeping previous in-memory config"
+                );
+                return ReloadOutcome::Failed;
+            }
+        };
+
+        if raw == self.config_raw || self.last_failed_config_raw.as_deref() == Some(raw.as_str()) {
+            return ReloadOutcome::Unchanged;
+        }
+
+        let new_config = match AppConfig::parse_with_source(&raw, &self.config_path) {
             Ok(cfg) => cfg,
             Err(err) => {
+                self.last_failed_config_raw = Some(raw);
                 warn!(
                     config_path = %self.config_path.display(),
                     error = ?err,
@@ -212,6 +241,8 @@ where
         };
 
         if new_config == self.config {
+            self.config_raw = raw;
+            self.last_failed_config_raw = None;
             return ReloadOutcome::Unchanged;
         }
 
@@ -225,6 +256,7 @@ where
             match self.notifier_factory.build(new_config.ntfy.clone()) {
                 Ok(notifier) => new_notifier = Some(notifier),
                 Err(err) => {
+                    self.last_failed_config_raw = Some(raw);
                     warn!(
                         config_path = %self.config_path.display(),
                         error = ?err,
@@ -236,6 +268,8 @@ where
         }
 
         self.config = new_config;
+        self.config_raw = raw;
+        self.last_failed_config_raw = None;
         if let Some(notifier) = new_notifier {
             self.notifier = notifier;
         }
@@ -308,20 +342,14 @@ where
     fn is_quiet_hours_suppressed(&self) -> bool {
         self.config.policy.suppress_in_quiet_hours && self.config.now_in_quiet_hours()
     }
-
-    fn refresh_last_idle_snapshot_fingerprint(&mut self, samples: &[crate::gpu::GpuSample]) {
-        let active_idle_rows = build_active_idle_rows(&self.policy_engine, samples, &[]);
-        self.last_idle_snapshot_fingerprint =
-            notification_fingerprint(&self.config, &active_idle_rows);
-    }
 }
 
-fn notification_fingerprint(config: &AppConfig, rows: &[NotificationRow]) -> Option<String> {
+fn notification_fingerprint(rows: &[NotificationRow]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
 
-    Some(render_notification(&config.ntfy, rows).fingerprint())
+    Some(rows_fingerprint(rows))
 }
 
 fn build_active_idle_rows(
@@ -403,13 +431,16 @@ mod tests {
         AppConfig, MonitorConfig, NotificationPolicyConfig, NtfyConfig, QuietWindow, TriggerMode,
     };
     use crate::gpu::{GpuSample, GpuSampler};
-    use crate::notify::Notifier;
+    use crate::notify::{Notifier, render_notification};
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone)]
     struct SequenceSampler {
@@ -629,7 +660,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("gpu-usage-ntfy-test-{nanos}.toml"));
+        let sequence = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "gpu-usage-ntfy-test-{}-{nanos}-{sequence}.toml",
+            std::process::id()
+        ));
         fs::write(&path, content).expect("failed to write temp config");
         path
     }
@@ -984,6 +1019,38 @@ suppress_in_quiet_hours = false
     }
 
     #[test]
+    fn reload_skips_disk_parse_when_config_file_is_unchanged() {
+        let config_path = write_temp_config(
+            r#"
+[ntfy]
+topic = "topic-a"
+"#,
+        );
+
+        let config = AppConfig::load(&config_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier);
+
+        let mut app = MonitorApp::new(
+            &config_path,
+            config.clone(),
+            sampler,
+            Arc::new(factory.clone()),
+        )
+        .expect("app should construct");
+
+        let outcome = app.try_reload_config();
+        assert_eq!(outcome, ReloadOutcome::Unchanged);
+        assert_eq!(factory.build_calls(), 1);
+        assert_eq!(
+            app.config.monitor.interval_seconds,
+            config.monitor.interval_seconds
+        );
+        assert_eq!(app.config.ntfy.topic, config.ntfy.topic);
+    }
+
+    #[test]
     fn reload_invalid_config_keeps_previous_config() {
         let config_path = write_temp_config(
             r#"
@@ -1023,6 +1090,64 @@ topic = "topic-a"
         assert_eq!(outcome, ReloadOutcome::Failed);
         assert_eq!(factory.build_calls(), 1);
         assert_eq!(app.config, config);
+    }
+
+    #[test]
+    fn repeated_reload_failure_is_debounced_until_file_changes() {
+        let config_path = write_temp_config(
+            r#"
+[ntfy]
+topic = "topic-a"
+"#,
+        );
+
+        let config = AppConfig::load(&config_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier);
+
+        let mut app = MonitorApp::new(
+            &config_path,
+            config.clone(),
+            sampler,
+            Arc::new(factory.clone()),
+        )
+        .expect("app should construct");
+
+        fs::write(
+            &config_path,
+            r#"
+[monitor]
+interval_seconds = 0
+
+[ntfy]
+topic = "topic-a"
+"#,
+        )
+        .expect("should write invalid config");
+
+        assert_eq!(app.try_reload_config(), ReloadOutcome::Failed);
+        assert_eq!(app.try_reload_config(), ReloadOutcome::Unchanged);
+
+        fs::write(
+            &config_path,
+            r#"
+[monitor]
+interval_seconds = 5
+
+[ntfy]
+topic = "topic-a"
+"#,
+        )
+        .expect("should write valid config");
+
+        assert_eq!(
+            app.try_reload_config(),
+            ReloadOutcome::Reloaded {
+                interval_changed: true
+            }
+        );
+        assert_eq!(app.config, AppConfig::load(&config_path).unwrap());
     }
 
     #[test]

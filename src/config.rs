@@ -1,6 +1,6 @@
 use crate::timeutil;
 use anyhow::{Context, Result, bail};
-use chrono::Timelike;
+use chrono::{DateTime, Timelike, Utc};
 use reqwest::Url;
 use serde::Deserialize;
 use std::env;
@@ -29,6 +29,10 @@ impl AppConfig {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
+        Self::parse_with_source(&raw, path)
+    }
+
+    pub fn parse_with_source(raw: &str, path: &Path) -> Result<Self> {
         let mut config: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse TOML config: {}", path.display()))?;
 
@@ -126,9 +130,15 @@ impl AppConfig {
             return false;
         }
 
-        let now = chrono::Utc::now()
-            .with_timezone(&timeutil::utc8_offset())
-            .time();
+        self.now_in_quiet_hours_at(Utc::now())
+    }
+
+    pub fn now_in_quiet_hours_at(&self, now: DateTime<Utc>) -> bool {
+        if self.quiet_hours.is_empty() {
+            return false;
+        }
+
+        let now = now.with_timezone(&timeutil::utc8_offset()).time();
         self.quiet_hours.iter().any(|q| q.contains_time(now))
     }
 
@@ -201,7 +211,7 @@ impl Default for MonitorConfig {
         Self {
             interval_seconds: 10,
             send_startup_notification: true,
-            sample_log: true,
+            sample_log: false,
         }
     }
 }
@@ -379,6 +389,9 @@ fn parse_clock_time(raw: &str) -> Result<ClockTime> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::hint::black_box;
+    use std::path::Path;
+    use std::time::Instant;
 
     #[test]
     fn quiet_hours_cross_day() {
@@ -427,6 +440,7 @@ topic = "my-topic"
         cfg.validate().unwrap();
 
         assert_eq!(cfg.monitor.interval_seconds, 10);
+        assert!(!cfg.monitor.sample_log);
         assert_eq!(cfg.ntfy.server, "https://ntfy.sh");
         assert_eq!(cfg.policy.trigger_mode, TriggerMode::Both);
         assert_eq!(cfg.policy.gpu_util_percent, 20.0);
@@ -531,5 +545,44 @@ topic = "my-topic"
         cfg.resolve_from_env().unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("must not include query parameters or fragments"));
+    }
+
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn bench_parse_with_source_vs_unchanged_raw_short_circuit() {
+        let raw = r#"
+[monitor]
+interval_seconds = 10
+send_startup_notification = false
+
+[ntfy]
+topic = "bench-topic"
+
+[policy]
+trigger_after_consecutive_samples = 1
+recovery_after_consecutive_samples = 1
+"#;
+        let cached = raw.to_string();
+        let iterations = 20_000;
+
+        let short_circuit_started_at = Instant::now();
+        for _ in 0..iterations {
+            black_box(raw == cached.as_str());
+        }
+        let short_circuit_elapsed = short_circuit_started_at.elapsed();
+
+        let parse_started_at = Instant::now();
+        for _ in 0..iterations {
+            let cfg = AppConfig::parse_with_source(raw, Path::new("bench-config.toml")).unwrap();
+            black_box(cfg.monitor.interval_seconds);
+        }
+        let parse_elapsed = parse_started_at.elapsed();
+
+        eprintln!(
+            "unchanged raw compare: {:?}, parse_with_source: {:?}",
+            short_circuit_elapsed, parse_elapsed
+        );
+
+        assert!(short_circuit_elapsed < parse_elapsed);
     }
 }

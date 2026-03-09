@@ -51,8 +51,9 @@ pub struct NotificationPayload {
 }
 
 impl NotificationPayload {
-    pub fn fingerprint(&self) -> String {
-        self.fingerprint.clone()
+    #[cfg(test)]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 }
 
@@ -316,6 +317,16 @@ pub fn render_notification(config: &NtfyConfig, rows: &[NotificationRow]) -> Not
         config.priority.saturating_sub(1).max(1)
     };
 
+    NotificationPayload {
+        title,
+        body,
+        tags,
+        priority,
+        fingerprint: rows_fingerprint(rows),
+    }
+}
+
+pub fn rows_fingerprint(rows: &[NotificationRow]) -> String {
     let mut signature_parts = rows
         .iter()
         .map(|row| {
@@ -327,14 +338,7 @@ pub fn render_notification(config: &NtfyConfig, rows: &[NotificationRow]) -> Not
         })
         .collect::<Vec<_>>();
     signature_parts.sort();
-
-    NotificationPayload {
-        title,
-        body,
-        tags,
-        priority,
-        fingerprint: signature_parts.join("|"),
-    }
+    signature_parts.join("|")
 }
 
 fn format_events_markdown_table(rows: &[NotificationRow]) -> String {
@@ -467,6 +471,8 @@ mod tests {
     use crate::gpu::GpuSample;
     use crate::policy::PolicyEngine;
     use chrono::{TimeZone, Utc};
+    use std::hint::black_box;
+    use std::time::Instant;
 
     fn test_config() -> NtfyConfig {
         NtfyConfig {
@@ -781,5 +787,53 @@ mod tests {
         let payload2 = payload_from_events(&config, &[event7]);
 
         assert_ne!(payload1.fingerprint(), payload2.fingerprint());
+    }
+
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn bench_rows_fingerprint_vs_full_render_path() {
+        let rows = (0..64)
+            .map(|index| NotificationRow {
+                gpu_index: index,
+                gpu_uuid: format!("GPU-{index}"),
+                gpu_name: "NVIDIA GeForce RTX 4090".to_string(),
+                gpu_util_percent: (index % 15) as f64,
+                memory_used_bytes: 1_500_000_000 + (index as u64 * 1_000_000),
+                kind: if index % 2 == 0 {
+                    PolicyEventKind::Alert
+                } else {
+                    PolicyEventKind::Recovery
+                },
+                reason: if index % 2 == 0 {
+                    "idle_still_detected".to_string()
+                } else {
+                    "busy_detected".to_string()
+                },
+            })
+            .collect::<Vec<_>>();
+        let config = test_config();
+        let iterations = 5_000;
+
+        let fingerprint_started_at = Instant::now();
+        let mut fingerprint_len = 0usize;
+        for _ in 0..iterations {
+            fingerprint_len += rows_fingerprint(&rows).len();
+        }
+        let fingerprint_elapsed = fingerprint_started_at.elapsed();
+
+        let render_started_at = Instant::now();
+        let mut render_len = 0usize;
+        for _ in 0..iterations {
+            render_len += render_notification(&config, &rows).fingerprint().len();
+        }
+        let render_elapsed = render_started_at.elapsed();
+
+        black_box(fingerprint_len + render_len);
+        eprintln!(
+            "rows_fingerprint: {:?}, render_notification(...).fingerprint(): {:?}",
+            fingerprint_elapsed, render_elapsed
+        );
+
+        assert!(fingerprint_elapsed < render_elapsed);
     }
 }

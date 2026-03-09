@@ -29,7 +29,7 @@ struct Args {
     config: PathBuf,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     init_tracing()?;
 

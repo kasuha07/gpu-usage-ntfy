@@ -142,7 +142,7 @@ chmod 600 config.toml
 | --- | --- |
 | `interval_seconds` | 采样周期（秒） |
 | `send_startup_notification` | 启动时是否发送通知；程序收到 `Ctrl+C` 退出时仍会发送退出通知 |
-| `sample_log` | 是否输出每次采样日志 |
+| `sample_log` | 是否输出每次采样日志（默认 `false`，仅建议排障时开启） |
 
 ### `[ntfy]`
 
