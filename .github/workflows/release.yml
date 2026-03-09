@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to release (for manual runs)
+        description: "Existing tag to release (for example: v0.1.1)"
         required: true
         type: string
 
@@ -19,13 +19,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create GitHub release
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+
+          if [[ -z "${tag}" || "${tag}" != v* ]]; then
+            echo "Tag must start with v, got: ${tag:-<empty>}" >&2
+            exit 1
+          fi
+
+          package_dir="gpu-usage-ntfy-${tag}-x86_64-unknown-linux-gnu"
+          archive="${package_dir}.tar.gz"
+          checksum="${archive}.sha256"
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "package_dir=${package_dir}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create GitHub release if missing
         uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
         with:
           script: |
-            const tag = context.eventName === 'push'
-              ? context.ref.replace('refs/tags/', '')
-              : context.payload.inputs?.tag;
+            const tag = process.env.TAG;
 
             if (!tag || !tag.startsWith('v')) {
               core.setFailed(`Tag must start with v. Received: ${tag ?? '(empty)'}`);
@@ -69,3 +104,36 @@ jobs:
             });
 
             core.info(`Created release for ${tag}.`);
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release artifacts
+        id: package
+        shell: bash
+        run: |
+          pkg_dir="${{ steps.meta.outputs.package_dir }}"
+          mkdir -p "${pkg_dir}"
+
+          cp target/release/gpu-usage-ntfy "${pkg_dir}/"
+          cp README.md LICENSE config.example.toml "${pkg_dir}/"
+
+          tar -czf "${{ steps.meta.outputs.archive }}" "${pkg_dir}"
+          sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.checksum }}"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package_dir }}
+          path: |
+            ${{ steps.meta.outputs.archive }}
+            ${{ steps.meta.outputs.checksum }}
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.archive }}" \
+            "${{ steps.meta.outputs.checksum }}" \
+            --clobber
