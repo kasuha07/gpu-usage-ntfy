@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/kasuha07/gpu-usage-ntfy/compare/gpu-usage-ntfy-v0.2.1...gpu-usage-ntfy-v0.2.2) (2026-03-09)
+
+
+### Performance Improvements
+
+* reduce monitor runtime overhead and document lightweight logging defaults ([7e344ab](https://github.com/kasuha07/gpu-usage-ntfy/commit/7e344ab4c196c6914125658b114363a1f80d8c02))
+
 ## [0.2.1](https://github.com/kasuha07/gpu-usage-ntfy/compare/gpu-usage-ntfy-v0.2.0...gpu-usage-ntfy-v0.2.1) (2026-03-09)
 
 
