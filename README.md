@@ -1,5 +1,9 @@
 # gpu-usage-ntfy
 
+[![CI](https://github.com/kasuha07/gpu-usage-ntfy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kasuha07/gpu-usage-ntfy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kasuha07/gpu-usage-ntfy?display_name=tag)](https://github.com/kasuha07/gpu-usage-ntfy/releases/latest)
+[![License](https://img.shields.io/github/license/kasuha07/gpu-usage-ntfy)](https://github.com/kasuha07/gpu-usage-ntfy/blob/main/LICENSE)
+
 一个面向 Linux + NVIDIA GPU 环境的 Rust 常驻监控工具：通过 NVML 持续采集 GPU 利用率与显存占用，并基于可配置阈值推断 GPU 是否处于“空闲”状态；当满足策略条件时通过 ntfy 发送通知，并在 GPU 恢复繁忙时按策略发送恢复通知。
 
 ## 适用场景
