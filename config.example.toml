@@ -3,7 +3,7 @@
 # 注意：支持热重载，修改并保存后会在下一次采样周期生效
 # 注意：程序固定使用 UTC+8 作为日志与 quiet_hours 判定时区
 interval_seconds = 10
-# 启动/退出时发送系统通知
+# 启动时发送系统通知（Ctrl+C 退出时仍会发送退出通知）
 send_startup_notification = true
 # 输出每次采样日志
 sample_log = true
