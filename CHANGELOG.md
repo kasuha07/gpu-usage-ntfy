@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/kasuha07/gpu-usage-ntfy/compare/gpu-usage-ntfy-v0.2.0...gpu-usage-ntfy-v0.2.1) (2026-03-09)
+
+
+### Bug Fixes
+
+* support component-style release tags ([c0f563e](https://github.com/kasuha07/gpu-usage-ntfy/commit/c0f563e7666307e646b5a9cd199e51588a955796))
+
 ## [0.2.0](https://github.com/kasuha07/gpu-usage-ntfy/compare/v0.1.0...gpu-usage-ntfy-v0.2.0) (2026-03-09)
 
 
