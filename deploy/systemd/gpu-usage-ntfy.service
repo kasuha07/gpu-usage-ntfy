@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=__RUN_USER__
+Group=__RUN_GROUP__
 WorkingDirectory=__ROOT_DIR__
 EnvironmentFile=-__ENV_PATH__
 Environment=RUST_LOG=info

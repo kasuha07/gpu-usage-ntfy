@@ -530,17 +530,23 @@ render_service_file() {
   local escaped_config_path
   local escaped_env_path
   local escaped_binary_path
+  local escaped_run_user
+  local escaped_run_group
 
   escaped_root="$(sed_escape_replacement "$ROOT_DIR")"
   escaped_config_path="$(sed_escape_replacement "$CONFIG_PATH")"
   escaped_env_path="$(sed_escape_replacement "$ENV_PATH")"
   escaped_binary_path="$(sed_escape_replacement "$BINARY_PATH")"
+  escaped_run_user="$(sed_escape_replacement "$CONFIG_OWNER")"
+  escaped_run_group="$(sed_escape_replacement "$CONFIG_GROUP")"
 
   sed \
     -e "s|__ROOT_DIR__|$escaped_root|g" \
     -e "s|__CONFIG_PATH__|$escaped_config_path|g" \
     -e "s|__ENV_PATH__|$escaped_env_path|g" \
     -e "s|__BINARY_PATH__|$escaped_binary_path|g" \
+    -e "s|__RUN_USER__|$escaped_run_user|g" \
+    -e "s|__RUN_GROUP__|$escaped_run_group|g" \
     "$SERVICE_TEMPLATE_PATH" > "$output_path"
 }
 
@@ -646,12 +652,26 @@ ENV_EOF
 ensure_release_binary() {
   section "release binary"
 
-  if [[ -x "$BINARY_PATH" ]]; then
-    pass "release binary already exists: $BINARY_PATH"
+  local needs_build=no
+
+  if [[ ! -x "$BINARY_PATH" ]]; then
+    needs_build=yes
+    info 'release binary missing; building it now'
+  elif find \
+    "$ROOT_DIR/src" \
+    "$ROOT_DIR/Cargo.toml" \
+    "$ROOT_DIR/Cargo.lock" \
+    -newer "$BINARY_PATH" \
+    -print -quit | grep -q .; then
+    needs_build=yes
+    info 'source files are newer than the existing release binary; rebuilding'
+  fi
+
+  if [[ "$needs_build" == no ]]; then
+    pass "release binary already up to date: $BINARY_PATH"
     return 0
   fi
 
-  info 'release binary missing; building it now'
   local build_user="${SUDO_USER:-}"
   local quoted_root_dir
   quoted_root_dir="$(shell_quote "$ROOT_DIR")"
@@ -663,6 +683,18 @@ ensure_release_binary() {
   fi
 
   pass 'built release binary'
+}
+
+enable_and_restart_service() {
+  "$SYSTEMCTL_BIN" enable "$UNIT_NAME" >/dev/null
+
+  if "$SYSTEMCTL_BIN" is-active --quiet "$UNIT_NAME"; then
+    "$SYSTEMCTL_BIN" restart "$UNIT_NAME"
+    pass "已重启 $UNIT_NAME，使新的二进制/配置/env 生效"
+  else
+    "$SYSTEMCTL_BIN" start "$UNIT_NAME"
+    pass "已启动 $UNIT_NAME"
+  fi
 }
 
 install_and_start_service() {
@@ -680,7 +712,7 @@ install_and_start_service() {
   rm -f "$rendered_service"
 
   "$SYSTEMCTL_BIN" daemon-reload
-  "$SYSTEMCTL_BIN" enable --now "$UNIT_NAME"
+  enable_and_restart_service
   "$SYSTEMCTL_BIN" status --no-pager --lines=20 "$UNIT_NAME"
 }
 

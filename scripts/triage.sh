@@ -18,6 +18,97 @@ warn() { echo "[WARN] $*"; WARNS=$((WARNS + 1)); }
 info() { echo "[INFO] $*"; }
 section() { echo; echo "=== $* ==="; }
 
+file_mtime_epoch() {
+  local path="$1"
+  [[ -e "$path" ]] || return 1
+  stat -c '%Y' "$path"
+}
+
+service_start_epoch() {
+  local started_at
+  started_at="$("$SYSTEMCTL_BIN" show "$UNIT_NAME" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+  [[ -n "$started_at" && "$started_at" != "n/a" ]] || return 1
+  date -d "$started_at" +%s 2>/dev/null
+}
+
+service_start_timestamp_raw() {
+  local started_at
+  started_at="$("$SYSTEMCTL_BIN" show "$UNIT_NAME" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+  [[ -n "$started_at" && "$started_at" != "n/a" ]] || return 1
+  printf '%s' "$started_at"
+}
+
+check_restart_required() {
+  local path="$1"
+  local label="$2"
+  local service_epoch="$3"
+  local file_epoch
+
+  file_epoch="$(file_mtime_epoch "$path" || true)"
+  if [[ -z "$file_epoch" ]]; then
+    return 0
+  fi
+
+  if (( file_epoch > service_epoch )); then
+    fail "$label is newer than the running service; restart $UNIT_NAME to apply it"
+  else
+    pass "running service is at least as new as $label"
+  fi
+}
+
+read_env_file_token() {
+  [[ -f "$ENV_PATH" ]] || return 1
+  local line
+  line="$(sed -n 's/^NTFY_TOKEN=//p' "$ENV_PATH" | head -n1)"
+  [[ -n "$line" ]] || return 1
+
+  if [[ "$line" == '"'*'"' && ${#line} -ge 2 ]]; then
+    line="${line:1:${#line}-2}"
+  fi
+
+  local output=""
+  local i
+  local current_char
+  for ((i = 0; i < ${#line}; i++)); do
+    current_char="${line:$i:1}"
+    if [[ "$current_char" == '\' && $((i + 1)) -lt ${#line} ]]; then
+      ((i++))
+      output+="${line:$i:1}"
+    else
+      output+="$current_char"
+    fi
+  done
+
+  printf '%s' "$output"
+}
+
+check_running_process_matches_service() {
+  local main_pid="$1"
+  local -a proc_argv=()
+  local config_seen=no
+
+  mapfile -d '' -t proc_argv < "/proc/$main_pid/cmdline"
+
+  if [[ "${proc_argv[0]:-}" == "$BINARY_PATH" ]]; then
+    pass "running process uses expected binary path"
+  else
+    fail "running process binary path does not match $BINARY_PATH"
+  fi
+
+  for ((i = 0; i < ${#proc_argv[@]} - 1; i++)); do
+    if [[ "${proc_argv[$i]}" == "--config" && "${proc_argv[$((i + 1))]}" == "$CONFIG_PATH" ]]; then
+      config_seen=yes
+      break
+    fi
+  done
+
+  if [[ "$config_seen" == yes ]]; then
+    pass "running process uses expected config path"
+  else
+    fail "running process does not appear to use --config $CONFIG_PATH"
+  fi
+}
+
 section "config.toml"
 if [[ -f "$CONFIG_PATH" ]]; then
   pass "config file exists: $CONFIG_PATH"
@@ -97,9 +188,10 @@ else
       fi
 
       if [[ $EUID -eq 0 ]]; then
-        if grep -Eq '^NTFY_TOKEN=replace_with_rotated_token$' "$ENV_PATH"; then
+        static_env_token="$(read_env_file_token || true)"
+        if grep -Eq '^NTFY_TOKEN="?replace_with_rotated_token"?$' "$ENV_PATH"; then
           fail "NTFY_TOKEN is still the placeholder value in $ENV_PATH"
-        elif grep -Eq '^NTFY_TOKEN=.+' "$ENV_PATH"; then
+        elif [[ -n "$static_env_token" ]]; then
           pass "NTFY_TOKEN is set in $ENV_PATH"
         else
           fail "NTFY_TOKEN is missing or empty in $ENV_PATH"
@@ -151,12 +243,72 @@ else
   warn "systemd ExecStart does not appear to point at this checkout"
 fi
 
+if [[ "$active_state" == "active" ]]; then
+  service_epoch="$(service_start_epoch || true)"
+  if [[ -n "${service_epoch:-}" ]]; then
+    pass "service start timestamp is available for restart checks"
+    check_restart_required "$BINARY_PATH" "release binary" "$service_epoch"
+    fragment_path="$("$SYSTEMCTL_BIN" show "$UNIT_NAME" -p FragmentPath --value 2>/dev/null || true)"
+    if [[ -n "$fragment_path" && "$fragment_path" != "n/a" ]]; then
+      check_restart_required "$fragment_path" "installed unit file" "$service_epoch"
+    fi
+    if [[ "$CONFIG_USES_TOKEN_ENV" == yes ]]; then
+      env_freshness_fallback_needed=yes
+    fi
+  else
+    warn "could not determine service start time; restart freshness checks skipped"
+  fi
+
+  main_pid="$("$SYSTEMCTL_BIN" show "$UNIT_NAME" -p MainPID --value 2>/dev/null || true)"
+  if [[ -n "$main_pid" && "$main_pid" != "0" && -r "/proc/$main_pid/cmdline" ]]; then
+    check_running_process_matches_service "$main_pid"
+  else
+    warn "could not read /proc/<pid>/cmdline to verify the live process command line"
+  fi
+
+  if [[ "$CONFIG_USES_TOKEN_ENV" == yes && $EUID -eq 0 ]]; then
+    if [[ -n "$main_pid" && "$main_pid" != "0" && -r "/proc/$main_pid/environ" ]]; then
+      env_token="$(read_env_file_token || true)"
+      proc_token="$(tr '\0' '\n' < "/proc/$main_pid/environ" | sed -n 's/^NTFY_TOKEN=//p' | head -n1)"
+
+      if [[ -z "$proc_token" ]]; then
+        fail "running service is missing NTFY_TOKEN in its environment"
+      elif [[ "$env_token" == "$proc_token" ]]; then
+        pass "running service environment matches $ENV_PATH"
+        env_freshness_fallback_needed=no
+      else
+        fail "running service is using a different NTFY_TOKEN than $ENV_PATH; restart is required"
+      fi
+    else
+      warn "could not read /proc/<pid>/environ to compare the live NTFY_TOKEN"
+    fi
+  elif [[ "$CONFIG_USES_TOKEN_ENV" == yes ]]; then
+    warn "run with sudo to compare the live NTFY_TOKEN against $ENV_PATH"
+  fi
+
+  if [[ "${env_freshness_fallback_needed:-no}" == yes ]]; then
+    warn "falling back to env file mtime because the live NTFY_TOKEN could not be compared"
+    if [[ -n "${service_epoch:-}" ]]; then
+      check_restart_required "$ENV_PATH" "$ENV_PATH" "$service_epoch"
+    fi
+  fi
+fi
+
 section "recent logs"
-logs="$(journalctl -u "$UNIT_NAME" -n 120 --no-pager 2>/dev/null || true)"
+logs_since=()
+if [[ "$active_state" == "active" ]]; then
+  current_start_raw="$(service_start_timestamp_raw || true)"
+  if [[ -n "$current_start_raw" ]]; then
+    logs_since=(--since "$current_start_raw")
+    info "only checking logs since current service start: $current_start_raw"
+  fi
+fi
+
+logs="$(journalctl -u "$UNIT_NAME" "${logs_since[@]}" -n 120 --no-pager 2>/dev/null || true)"
 if [[ -z "$logs" ]]; then
   warn "no recent journal logs found for $UNIT_NAME"
 else
-  bad_regex='authentication failed|failed to load config|failed to parse TOML config|failed to initialize NVML|invalid ntfy\.server|ntfy\.server must use https:// unless ntfy\.allow_insecure_http = true|ntfy\.token_env only supports|missing env var for ntfy token|poll cycle failed'
+  bad_regex='authentication failed|failed to load config|failed to parse TOML config|failed to initialize NVML|invalid ntfy\.server|ntfy\.server must use https:// unless ntfy\.allow_insecure_http = true|ntfy\.token_env only supports|missing env var for ntfy token|poll cycle failed|failed to reload config, keeping previous in-memory config'
   good_regex='GPU monitor started|gpu sample|ntfy notification sent|suppressed by quiet hours|no GPU devices found by NVML'
 
   if printf '%s

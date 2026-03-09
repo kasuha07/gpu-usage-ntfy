@@ -15,6 +15,8 @@ CHANGED=0
 MANUAL_STEPS=0
 CONFIG_HAS_TOKEN=no
 CONFIG_USES_TOKEN_ENV=no
+RUNTIME_OWNER=root
+RUNTIME_GROUP=root
 
 pass() { echo "[PASS] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -29,23 +31,42 @@ sed_escape_replacement() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\\\&/g'
 }
 
+resolve_runtime_owner_group() {
+  if [[ -f "$CONFIG_PATH" ]]; then
+    RUNTIME_OWNER="$(stat -c '%U' "$CONFIG_PATH")"
+    RUNTIME_GROUP="$(stat -c '%G' "$CONFIG_PATH")"
+  elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    RUNTIME_OWNER="$SUDO_USER"
+    RUNTIME_GROUP="$(id -gn "$SUDO_USER")"
+  else
+    RUNTIME_OWNER="root"
+    RUNTIME_GROUP="root"
+  fi
+}
+
 render_service_file() {
   local output_path="$1"
   local escaped_root
   local escaped_config_path
   local escaped_env_path
   local escaped_binary_path
+  local escaped_run_user
+  local escaped_run_group
 
   escaped_root="$(sed_escape_replacement "$ROOT_DIR")"
   escaped_config_path="$(sed_escape_replacement "$CONFIG_PATH")"
   escaped_env_path="$(sed_escape_replacement "$ENV_PATH")"
   escaped_binary_path="$(sed_escape_replacement "$BINARY_PATH")"
+  escaped_run_user="$(sed_escape_replacement "$RUNTIME_OWNER")"
+  escaped_run_group="$(sed_escape_replacement "$RUNTIME_GROUP")"
 
   sed \
     -e "s|__ROOT_DIR__|$escaped_root|g" \
     -e "s|__CONFIG_PATH__|$escaped_config_path|g" \
     -e "s|__ENV_PATH__|$escaped_env_path|g" \
     -e "s|__BINARY_PATH__|$escaped_binary_path|g" \
+    -e "s|__RUN_USER__|$escaped_run_user|g" \
+    -e "s|__RUN_GROUP__|$escaped_run_group|g" \
     "$SERVICE_SRC" > "$output_path"
 }
 
@@ -136,12 +157,26 @@ fix_env_file() {
 ensure_release_binary() {
   section "release binary"
 
-  if [[ -x "$BINARY_PATH" ]]; then
-    pass "release binary already exists: $BINARY_PATH"
+  local needs_build=no
+
+  if [[ ! -x "$BINARY_PATH" ]]; then
+    needs_build=yes
+    info 'release binary missing; building it now'
+  elif find \
+    "$ROOT_DIR/src" \
+    "$ROOT_DIR/Cargo.toml" \
+    "$ROOT_DIR/Cargo.lock" \
+    -newer "$BINARY_PATH" \
+    -print -quit | grep -q .; then
+    needs_build=yes
+    info 'source files are newer than the existing release binary; rebuilding'
+  fi
+
+  if [[ "$needs_build" == no ]]; then
+    pass "release binary already up to date: $BINARY_PATH"
     return 0
   fi
 
-  info 'release binary missing; building it now'
   local build_user="${SUDO_USER:-}"
   local quoted_root_dir
   quoted_root_dir="$(shell_quote "$ROOT_DIR")"
@@ -165,6 +200,7 @@ install_or_refresh_unit() {
 
   local rendered_service
   rendered_service="$(mktemp)"
+  resolve_runtime_owner_group
   render_service_file "$rendered_service"
   install -d -m 755 "$(dirname "$SERVICE_DST")"
   install -o root -g root -m 644 "$rendered_service" "$SERVICE_DST"
@@ -179,8 +215,15 @@ start_or_restart_service_if_ready() {
   section "service action"
 
   if [[ "$CONFIG_HAS_TOKEN" == yes || "$env_ready" == yes || "$CONFIG_USES_TOKEN_ENV" == no ]]; then
-    "$SYSTEMCTL_BIN" enable --now "$UNIT_NAME"
-    pass 'enabled and started gpu-usage-ntfy.service'
+    "$SYSTEMCTL_BIN" enable "$UNIT_NAME" >/dev/null
+    if "$SYSTEMCTL_BIN" is-active --quiet "$UNIT_NAME"; then
+      "$SYSTEMCTL_BIN" restart "$UNIT_NAME"
+      pass 'enabled and restarted gpu-usage-ntfy.service'
+    else
+      "$SYSTEMCTL_BIN" start "$UNIT_NAME"
+      pass 'enabled and started gpu-usage-ntfy.service'
+    fi
+    CHANGED=1
   else
     warn "skipping service start/restart until $ENV_PATH contains a real NTFY_TOKEN"
   fi
