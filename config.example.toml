@@ -12,10 +12,12 @@ sample_log = true
 # 可替换为自建 ntfy 服务器地址
 server = "https://ntfy.sh"
 topic = "gpu-usage-alerts"
-# 二选一：直接写 token 或从环境变量读取
+# 二选一：直接写 token 或从环境变量读取（推荐 token_env）
 # 若使用 ntfy.sh 公共 topic，通常无需 token（避免 403）
 # token = "tk_xxx"
 token_env = "NTFY_TOKEN"
+# 默认要求 HTTPS；仅在受信任内网调试时才显式放开
+# allow_insecure_http = true
 title_prefix = "GPU Monitor"
 # ntfy 优先级：1(最低) ~ 5(最高)
 priority = 4

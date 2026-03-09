@@ -1,11 +1,18 @@
 use crate::timeutil;
 use anyhow::{Context, Result, bail};
 use chrono::Timelike;
+use reqwest::Url;
 use serde::Deserialize;
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(unix)]
+use tracing::warn;
+
+const SUPPORTED_NTFY_TOKEN_ENV: &str = "NTFY_TOKEN";
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
@@ -38,6 +45,7 @@ impl AppConfig {
 
         config.resolve_from_env()?;
         config.validate()?;
+        config.warn_if_insecure_ntfy_auth_permissions(path);
         Ok(config)
     }
 
@@ -45,12 +53,23 @@ impl AppConfig {
         self.ntfy.server = self.ntfy.server.trim_end_matches('/').to_string();
 
         if let Some(env_name) = self.ntfy.token_env.clone() {
+            if env_name != SUPPORTED_NTFY_TOKEN_ENV {
+                bail!("ntfy.token_env only supports {}", SUPPORTED_NTFY_TOKEN_ENV);
+            }
+
             let token = env::var(&env_name)
                 .with_context(|| format!("missing env var for ntfy token: {}", env_name))?;
             self.ntfy.token = Some(token);
         } else if let Some(token) = self.ntfy.token.clone()
             && let Some(env_name) = parse_env_ref(&token)
         {
+            if env_name != SUPPORTED_NTFY_TOKEN_ENV {
+                bail!(
+                    "ntfy.token env reference only supports ${{{}}}",
+                    SUPPORTED_NTFY_TOKEN_ENV
+                );
+            }
+
             let resolved = env::var(env_name)
                 .with_context(|| format!("missing env var referenced by token: {}", env_name))?;
             self.ntfy.token = Some(resolved);
@@ -62,6 +81,14 @@ impl AppConfig {
     fn validate(&self) -> Result<()> {
         if self.monitor.interval_seconds == 0 {
             bail!("monitor.interval_seconds must be > 0");
+        }
+
+        self.validate_ntfy_server()?;
+
+        if let Some(token_env) = self.ntfy.token_env.as_deref()
+            && token_env != SUPPORTED_NTFY_TOKEN_ENV
+        {
+            bail!("ntfy.token_env only supports {}", SUPPORTED_NTFY_TOKEN_ENV);
         }
 
         if self.ntfy.topic.trim().is_empty() {
@@ -111,6 +138,45 @@ impl AppConfig {
             .time();
         self.quiet_hours.iter().any(|q| q.contains_time(now))
     }
+
+    fn validate_ntfy_server(&self) -> Result<()> {
+        let url = Url::parse(&self.ntfy.server)
+            .with_context(|| format!("invalid ntfy.server URL: {}", self.ntfy.server))?;
+
+        if url.host_str().is_none() {
+            bail!("ntfy.server must include a host");
+        }
+
+        match url.scheme() {
+            "https" => Ok(()),
+            "http" if self.ntfy.allow_insecure_http => Ok(()),
+            "http" => bail!("ntfy.server must use https:// unless ntfy.allow_insecure_http = true"),
+            _ => bail!("ntfy.server must use http:// or https://"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn warn_if_insecure_ntfy_auth_permissions(&self, path: &Path) {
+        if !self.ntfy.uses_auth() {
+            return;
+        }
+
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            warn!(
+                config_path = %path.display(),
+                mode = format!("{:03o}", mode),
+                "config file with ntfy auth is accessible by group/others; consider chmod 600"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn warn_if_insecure_ntfy_auth_permissions(&self, _path: &Path) {}
 }
 
 fn parse_env_ref(input: &str) -> Option<&str> {
@@ -146,12 +212,22 @@ pub struct NtfyConfig {
     pub topic: String,
     pub token: Option<String>,
     pub token_env: Option<String>,
+    pub allow_insecure_http: bool,
     pub title_prefix: String,
     pub priority: u8,
     pub tags: Vec<String>,
     pub timeout_seconds: u64,
     pub max_retries: u32,
     pub retry_initial_backoff_millis: u64,
+}
+
+impl NtfyConfig {
+    fn uses_auth(&self) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+            || self.token_env.is_some()
+    }
 }
 
 impl Default for NtfyConfig {
@@ -161,6 +237,7 @@ impl Default for NtfyConfig {
             topic: "gpu-usage-alerts".to_string(),
             token: None,
             token_env: None,
+            allow_insecure_http: false,
             title_prefix: "GPU Monitor".to_string(),
             priority: 4,
             tags: vec!["gpu".to_string(), "monitor".to_string()],
@@ -354,5 +431,62 @@ topic = "my-topic"
         assert_eq!(cfg.policy.gpu_util_percent, 20.0);
         assert_eq!(cfg.policy.memory_util_percent, 20.0);
         assert!(!cfg.policy.repeat_idle_notifications);
+        assert!(!cfg.ntfy.allow_insecure_http);
+    }
+
+    #[test]
+    fn rejects_unsupported_token_env_name() {
+        let raw = r#"
+[ntfy]
+topic = "my-topic"
+token_env = "AWS_SECRET_ACCESS_KEY"
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        let err = cfg.resolve_from_env().unwrap_err().to_string();
+        assert!(err.contains("ntfy.token_env only supports NTFY_TOKEN"));
+    }
+
+    #[test]
+    fn rejects_unsupported_token_env_reference() {
+        let raw = r#"
+[ntfy]
+topic = "my-topic"
+token = "${AWS_SECRET_ACCESS_KEY}"
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        let err = cfg.resolve_from_env().unwrap_err().to_string();
+        assert!(err.contains("ntfy.token env reference only supports ${NTFY_TOKEN}"));
+    }
+
+    #[test]
+    fn rejects_http_server_without_explicit_opt_in() {
+        let raw = r#"
+[ntfy]
+server = "http://ntfy.internal"
+topic = "my-topic"
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.resolve_from_env().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ntfy.server must use https:// unless ntfy.allow_insecure_http = true")
+        );
+    }
+
+    #[test]
+    fn allows_http_server_when_explicitly_enabled() {
+        let raw = r#"
+[ntfy]
+server = "http://ntfy.internal"
+topic = "my-topic"
+allow_insecure_http = true
+"#;
+
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.resolve_from_env().unwrap();
+        cfg.validate().unwrap();
     }
 }

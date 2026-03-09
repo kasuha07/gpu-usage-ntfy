@@ -450,6 +450,7 @@ mod tests {
             topic: "gpu-topic".to_string(),
             token: Some("secret_token".to_string()),
             token_env: None,
+            allow_insecure_http: false,
             title_prefix: "GPU".to_string(),
             priority: 4,
             tags: vec!["gpu".to_string()],
