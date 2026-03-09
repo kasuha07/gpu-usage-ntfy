@@ -218,6 +218,7 @@ where
         let interval_changed =
             new_config.monitor.interval_seconds != self.config.monitor.interval_seconds;
         let ntfy_changed = new_config.ntfy != self.config.ntfy;
+        let policy_changed = new_config.policy != self.config.policy;
 
         let mut new_notifier = None;
         if ntfy_changed {
@@ -238,13 +239,18 @@ where
         if let Some(notifier) = new_notifier {
             self.notifier = notifier;
         }
-        self.policy_engine = PolicyEngine::new(self.config.policy.clone());
-        self.last_idle_snapshot_fingerprint = None;
+        if policy_changed {
+            self.policy_engine = PolicyEngine::new(self.config.policy.clone());
+        }
+        if policy_changed || ntfy_changed {
+            self.last_idle_snapshot_fingerprint = None;
+        }
 
         info!(
             config_path = %self.config_path.display(),
             interval_seconds = self.config.monitor.interval_seconds,
             ntfy_changed,
+            policy_changed,
             "config reloaded"
         );
 
@@ -1054,5 +1060,68 @@ topic = "topic-b"
         let outcome = app.try_reload_config();
         assert_eq!(outcome, ReloadOutcome::Failed);
         assert_eq!(app.config, config);
+    }
+
+    #[tokio::test]
+    async fn reload_without_policy_change_preserves_active_alert_state() {
+        let config_path = write_temp_config(
+            r#"
+[monitor]
+interval_seconds = 10
+send_startup_notification = false
+sample_log = false
+
+[ntfy]
+topic = "topic-a"
+
+[policy]
+trigger_after_consecutive_samples = 1
+recovery_after_consecutive_samples = 1
+"#,
+        );
+
+        let config = AppConfig::load(&config_path).expect("initial config should load");
+        let sampler = SequenceSampler::new(vec![vec![sample_idle()], vec![sample_idle()]]);
+        let notifier = MockNotifier::new(false);
+        let factory = StaticNotifierFactory::new(notifier.clone());
+
+        let mut app = MonitorApp::new(&config_path, config, sampler, Arc::new(factory.clone()))
+            .expect("app should construct");
+
+        app.poll_once().await.expect("first poll should finish");
+        assert_eq!(notifier.event_calls(), 1);
+        assert_eq!(app.policy_engine.active_alerts(), 1);
+
+        fs::write(
+            &config_path,
+            r#"
+[monitor]
+interval_seconds = 10
+send_startup_notification = false
+sample_log = true
+
+[ntfy]
+topic = "topic-a"
+
+[policy]
+trigger_after_consecutive_samples = 1
+recovery_after_consecutive_samples = 1
+"#,
+        )
+        .expect("should write updated config");
+
+        let outcome = app.try_reload_config();
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                interval_changed: false
+            }
+        );
+        assert_eq!(factory.build_calls(), 1);
+        assert_eq!(app.policy_engine.active_alerts(), 1);
+
+        app.poll_once().await.expect("second poll should finish");
+        assert_eq!(notifier.event_calls(), 1);
+        assert_eq!(app.policy_engine.active_alerts(), 1);
     }
 }
