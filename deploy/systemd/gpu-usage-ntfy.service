@@ -1,0 +1,21 @@
+[Unit]
+Description=GPU idle ntfy monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__ROOT_DIR__
+EnvironmentFile=-__ENV_PATH__
+Environment=RUST_LOG=info
+ExecStart=__BINARY_PATH__ --config __CONFIG_PATH__
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=__ROOT_DIR__
+
+[Install]
+WantedBy=multi-user.target
